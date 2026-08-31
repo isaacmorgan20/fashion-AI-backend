@@ -1,0 +1,4 @@
+INFO:     127.0.0.1:62513 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62516 - "PATCH /api/v1/settings HTTP/1.1" 200 OK
+DEBUG create_order user=vmAFydyASYg6vw1FMNohGJKJMPf2 currency=USD general={'language': 'English', 'businessCategory': 'Fashion & Apparel', 'businessName': 'ThreadOS Fashion', 'timezone': 'Africa/Accra', 'businessEmail': 'test@example.com', 'businessPhone': '+233 24 000 0000', 'currency': 'USD'}
+INFO:     127.0.0.1:62521 - "POST /api/v1/orders HTTP/1.1" 200 OK
