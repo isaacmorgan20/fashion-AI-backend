@@ -9,6 +9,48 @@ class Channel(str, Enum):
     INSTAGRAM = "Instagram"
     FACEBOOK = "Facebook"
     WEBSITE = "Website"
+    TELEGRAM = "Telegram"
+
+
+class ChannelType(str, Enum):
+    WHATSAPP = "whatsapp"
+    INSTAGRAM = "instagram"
+    FACEBOOK = "facebook"
+    WEBSITE = "website"
+    TELEGRAM = "telegram"
+
+
+class ChannelConnectionStatus(str, Enum):
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    NOT_CONFIGURED = "not_configured"
+
+
+class ChannelConnection(BaseModel):
+    id: Optional[str] = None
+    type: ChannelType
+    status: ChannelConnectionStatus = ChannelConnectionStatus.NOT_CONFIGURED
+    enabled: bool = False
+    displayName: str = ""
+    credentials: Optional[dict] = None
+    metadata: Optional[dict] = None
+    lastConnectedAt: Optional[float] = None
+    lastMessageAt: Optional[float] = None
+    createdAt: float = Field(default_factory=lambda: __import__("time").time())
+    updatedAt: float = Field(default_factory=lambda: __import__("time").time())
+
+
+class ChannelConnectionCreate(BaseModel):
+    type: ChannelType
+    enabled: bool = True
+    credentials: Optional[dict] = None
+    metadata: Optional[dict] = None
+
+
+class ChannelConnectionUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    credentials: Optional[dict] = None
+    metadata: Optional[dict] = None
 
 
 class ConversationMode(str, Enum):
@@ -268,3 +310,149 @@ class SettingsUpdate(BaseModel):
     team: Optional[List[dict]] = None
     security: Optional[dict] = None
     appearance: Optional[dict] = None
+
+
+class NotificationEventType(str, Enum):
+    NEW_CONVERSATION = "new_conversation"
+    HUMAN_HANDOFF = "human_handoff"
+    NEW_ORDER = "new_order"
+    LOW_STOCK = "low_stock"
+    DAILY_SUMMARY = "daily_summary"
+
+
+class NotificationEvent(BaseModel):
+    id: Optional[str] = None
+    type: NotificationEventType
+    title: str
+    message: str
+    metadata: Optional[dict] = None
+    read: bool = False
+    createdAt: float = Field(default_factory=lambda: __import__("time").time())
+
+
+class NotificationEventCreate(BaseModel):
+    type: NotificationEventType
+    title: str
+    message: str
+    metadata: Optional[dict] = None
+
+
+class StorefrontSettings(BaseModel):
+    enabled: bool = True
+    storeName: str = ""
+    storeDescription: str = "Discover quality fashion, dresses, shoes and accessories."
+    showPrices: bool = True
+    showStock: bool = True
+    showCustomerChat: bool = True
+    showAiAssistant: bool = True
+    allowOrdering: bool = True
+    allowGuestBrowsing: bool = True
+
+
+class PublicStorefront(BaseModel):
+    sellerId: str
+    storeName: str
+    storeDescription: str
+    showPrices: bool
+    showStock: bool
+    showCustomerChat: bool
+    showAiAssistant: bool
+    allowOrdering: bool
+    allowGuestBrowsing: bool
+
+
+class TeamMemberRole(str, Enum):
+    OWNER = "Owner"
+    ADMIN = "Admin"
+    AGENT = "Agent"
+    VIEWER = "Viewer"
+
+
+class TeamMemberStatus(str, Enum):
+    ACTIVE = "Active"
+    PENDING = "Pending"
+    INACTIVE = "Inactive"
+
+
+class TeamMemberPermissions(BaseModel):
+    canManageProducts: bool = False
+    canManageOrders: bool = False
+    canManageCustomers: bool = False
+    canManageConversations: bool = False
+    canManageSettings: bool = False
+    canManageTeam: bool = False
+    canViewAnalytics: bool = False
+
+
+class TeamMember(BaseModel):
+    id: str
+    uid: Optional[str] = None
+    name: str
+    email: str
+    role: TeamMemberRole = TeamMemberRole.AGENT
+    status: TeamMemberStatus = TeamMemberStatus.PENDING
+    permissions: TeamMemberPermissions = TeamMemberPermissions()
+    invitedAt: Optional[float] = None
+    joinedAt: Optional[float] = None
+    invitedBy: Optional[str] = None
+
+
+class TeamMemberCreate(BaseModel):
+    email: str
+    name: str
+    role: TeamMemberRole = TeamMemberRole.AGENT
+    permissions: Optional[TeamMemberPermissions] = None
+
+
+class TeamMemberUpdate(BaseModel):
+    role: Optional[TeamMemberRole] = None
+    permissions: Optional[TeamMemberPermissions] = None
+    status: Optional[TeamMemberStatus] = None
+
+
+class Session(BaseModel):
+    id: str
+    user_id: str
+    session_token_hash: str
+    created_at: float
+    last_active_at: float
+    expires_at: float
+    revoked_at: Optional[float] = None
+    user_agent: Optional[str] = None
+    ip_address: Optional[str] = None
+    device_info: Optional[str] = None
+    is_current: bool = False
+
+
+class SessionCreate(BaseModel):
+    user_id: str
+    session_token_hash: str
+    user_agent: Optional[str] = None
+    ip_address: Optional[str] = None
+    device_info: Optional[str] = None
+    timeout_minutes: int = 30
+
+
+class SessionTimeout(str, Enum):
+    FIFTEEN_MINUTES = "15 minutes"
+    THIRTY_MINUTES = "30 minutes"
+    ONE_HOUR = "1 hour"
+    FOUR_HOURS = "4 hours"
+    NEVER = "never"
+
+
+TIMEOUT_MINUTES = {
+    "15 minutes": 15,
+    "30 minutes": 30,
+    "1 hour": 60,
+    "4 hours": 240,
+    "never": 0,
+}
+
+
+class SecuritySettings(BaseModel):
+    sessionTimeout: str = "30 minutes"
+    requirePasswordChange: bool = False
+    twoFactorEnabled: bool = False
+    loginNotifications: bool = True
+    sessionExpiry: bool = True

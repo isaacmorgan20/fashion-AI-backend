@@ -21,18 +21,31 @@ class ThreadOSAgent:
         else:
             self.model = None
 
-    def _get_system_prompt(self, products: List[ProductBase], business_info: Dict[str, Any], ai_settings: Optional[Dict[str, Any]] = None) -> str:
+    def _get_system_prompt(self, products: List[ProductBase], business_info: Dict[str, Any], ai_settings: Optional[Dict[str, Any]] = None, knowledge_settings: Optional[Dict[str, Any]] = None) -> str:
         ai_settings = ai_settings or {}
+        knowledge_settings = knowledge_settings or {}
+        
         # Use real product catalog as RAG source - never invent
         currency = business_info.get('currency', 'GHS')
-        # Respect product recommendations setting
-        if ai_settings.get("productRecommendations") is False:
+        
+        # Respect product information toggle
+        if not knowledge_settings.get("productInformation", True):
+            products_text = "(Product information disabled - do not reference products)"
+        elif ai_settings.get("productRecommendations") is False:
             products_text = "(Product recommendations disabled - do not suggest products)"
         else:
-            products_text = "\n".join([
-                f"- {p.name} ({p.category}): {currency} {p.price}, Stock: {p.stock}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}"
-                for p in products
-            ]) if products else "(No products in catalog)"
+            # Respect showAvailability setting - hide stock info if OFF
+            show_availability = ai_settings.get("showAvailability", True)
+            if show_availability:
+                products_text = "\n".join([
+                    f"- {p.name} ({p.category}): {currency} {p.price}, Stock: {p.stock}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}"
+                    for p in products
+                ]) if products else "(No products in catalog)"
+            else:
+                products_text = "\n".join([
+                    f"- {p.name} ({p.category}): {currency} {p.price}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}"
+                    for p in products
+                ]) if products else "(No products in catalog)"
 
         # Response style
         style = ai_settings.get("responseStyle", "Professional")
@@ -46,6 +59,9 @@ class ThreadOSAgent:
         # Order assistance
         order_capability = "3. Assist with placing orders" if ai_settings.get("orderAssistance", True) else "3. Order assistance is disabled - do not handle order/product assistance, hand off if needed"
 
+        # Stock visibility
+        stock_guideline = "" if ai_settings.get("showAvailability", True) else "- Do NOT mention stock levels, inventory counts, or whether items are in/out of stock. Simply state sizes and colors are available if asked."
+
         # Human handoff
         handoff_enabled = ai_settings.get("humanHandoff", True)
         handoff_section = """HANDOFF TRIGGERS:
@@ -54,19 +70,88 @@ class ThreadOSAgent:
 - Low confidence in response
 - Technical issues beyond your scope""" if handoff_enabled else "HANDOFF DISABLED: Do not offer or perform automatic human handoff. Handle within AI scope or state that human handoff is not available."
 
-        return f"""You are ThreadOS AI, a customer service and commerce agent for {business_info.get('businessName', 'ThreadOS Fashion')}.
-
-BUSINESS INFO:
+        # Build business info section based on businessInformation toggle
+        business_section = ""
+        if knowledge_settings.get("businessInformation", True):
+            custom_business_info = knowledge_settings.get("businessInformationContent", "").strip()
+            if custom_business_info:
+                business_section = f"""BUSINESS INFORMATION:
+{custom_business_info}"""
+            else:
+                business_section = f"""BUSINESS INFO:
 - Name: {business_info.get('businessName', 'ThreadOS Fashion')}
 - Category: {business_info.get('businessCategory', 'Fashion & Apparel')}
 - Currency: {currency}
 - Phone: {business_info.get('businessPhone', 'N/A')}
 - Email: {business_info.get('businessEmail', 'N/A')}
 - Location: Ghana
-- Delivery: 1-2 business days within Ghana
+- Delivery: 1-2 business days within Ghana"""
+
+        # Build FAQ section
+        faq_section = ""
+        if knowledge_settings.get("faq", True):
+            faq_content = knowledge_settings.get("faqContent", "").strip()
+            if faq_content:
+                faq_section = f"""FAQ (answer customer questions using this):
+{faq_content}"""
+
+        # Build delivery policy section
+        delivery_section = ""
+        if knowledge_settings.get("deliveryPolicy", True):
+            delivery_content = knowledge_settings.get("deliveryPolicyContent", "").strip()
+            if delivery_content:
+                delivery_section = f"""DELIVERY POLICY:
+{delivery_content}"""
+            else:
+                delivery_section = "DELIVERY POLICY: Standard delivery within 1-2 business days in Ghana."
+
+        # Build return policy section
+        return_section = ""
+        if knowledge_settings.get("returnPolicy", True):
+            return_content = knowledge_settings.get("returnPolicyContent", "").strip()
+            if return_content:
+                return_section = f"""RETURN POLICY:
+{return_content}"""
+
+        # Build payment policy section
+        payment_section = ""
+        if knowledge_settings.get("paymentPolicy", True):
+            payment_content = knowledge_settings.get("paymentPolicyContent", "").strip()
+            if payment_content:
+                payment_section = f"""PAYMENT POLICY:
+{payment_content}"""
+
+        # Build order information section
+        order_section = ""
+        if knowledge_settings.get("orderInformation", True):
+            order_content = knowledge_settings.get("orderInformationContent", "").strip()
+            if order_content:
+                order_section = f"""ORDER INFORMATION:
+{order_content}"""
+
+        # Build policy section from enabled policies
+        policy_parts = []
+        if delivery_section:
+            policy_parts.append(delivery_section)
+        if return_section:
+            policy_parts.append(return_section)
+        if payment_section:
+            policy_parts.append(payment_section)
+        if order_section:
+            policy_parts.append(order_section)
+        
+        policy_section = "\n\n".join(policy_parts) if policy_parts else ""
+
+        return f"""You are ThreadOS AI, a customer service and commerce agent for {business_info.get('businessName', 'ThreadOS Fashion')}.
+
+{business_section}
 
 PRODUCT CATALOG (RAG source - use only this, never invent):
 {products_text}
+
+{faq_section}
+
+{policy_section}
 
 YOUR CAPABILITIES:
 1. Answer product questions (availability, price, sizes, colors, details)
@@ -82,6 +167,7 @@ RESPONSE GUIDELINES:
 - Reference real product data from the catalog - never make up product info not in the catalog
 - If unsure about something, offer to connect to human
 - Keep responses concise but complete
+{stock_guideline}
 
 {handoff_section}
 
@@ -132,10 +218,12 @@ Return JSON with:
         request: ChatRequest,
         products: List[ProductBase],
         business_info: Dict[str, Any],
-        ai_settings: Optional[Dict[str, Any]] = None
+        ai_settings: Optional[Dict[str, Any]] = None,
+        knowledge_settings: Optional[Dict[str, Any]] = None
     ) -> AIResponse:
         """Generate AI response for customer message."""
         ai_settings = ai_settings or {}
+        knowledge_settings = knowledge_settings or {}
         if not self.client and not self.model:
             # Respect Human handoff OFF even when AI not configured
             if ai_settings.get("humanHandoff") is False:
@@ -162,7 +250,7 @@ Return JSON with:
         else:
             conversation_context = "(Previous conversation history not available - customer memory disabled)\n"
 
-        prompt = self._get_system_prompt(products, business_info, ai_settings)
+        prompt = self._get_system_prompt(products, business_info, ai_settings, knowledge_settings)
         full_prompt = f"{prompt}\n\nCONVERSATION HISTORY:\n{conversation_context}\nCustomer: {request.message}\n\nRespond as JSON:"
 
         try:

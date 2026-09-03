@@ -28,6 +28,15 @@ class Settings(BaseSettings):
     ai_temperature: float = 0.3
     ai_max_tokens: int = 2048
 
+    # WhatsApp Business API (Meta App credentials - NOT seller credentials)
+    # These are for the ThreadOS platform app, not individual seller connections
+    meta_app_id: Optional[str] = None
+    meta_app_secret: Optional[str] = None
+    meta_webhook_verify_token: Optional[str] = None
+    
+    # Base URL for webhook callbacks (must be HTTPS in production)
+    webhook_base_url: str = "https://your-domain.com/api/v1"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
