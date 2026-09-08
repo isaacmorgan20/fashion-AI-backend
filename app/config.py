@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:5173"
 
     # AI Agent
-    ai_model: str = "gemini-1.5-flash"
+    ai_model: str = "gemini-1.5-flash-latest"
     ai_temperature: float = 0.3
     ai_max_tokens: int = 2048
 
@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     meta_app_id: Optional[str] = None
     meta_app_secret: Optional[str] = None
     meta_webhook_verify_token: Optional[str] = None
+    
+    # WAGate.app WhatsApp API
+    wagate_base_url: str = "https://wagate.app"
+    wagate_api_key: Optional[str] = None
+    
+    # Telegram Bot API
+    telegram_bot_token: Optional[str] = None
+    telegram_webhook_secret: Optional[str] = None
     
     # Base URL for webhook callbacks (must be HTTPS in production)
     webhook_base_url: str = "https://your-domain.com/api/v1"

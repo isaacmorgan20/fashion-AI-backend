@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request, Response
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
+import json
 from app.models import (
     ConversationBase, ConversationCreate, ConversationUpdate,
     MessageBase, MessageCreate, ProductBase, ProductCreate, ProductUpdate,
@@ -17,7 +18,15 @@ from app.models import (
 )
 from app.firebase import get_firestore_client, verify_firebase_token
 from app.agent import agent
-from app.whatsapp import whatsapp_service
+from app.whatsapp import whatsapp_service, wagate_service
+from app.telegram import telegram_service
+from app.wagate_webhook import (
+    handle_wagate_webhook,
+    handle_wagate_webhook_verification,
+    NormalizedInboundEvent,
+    _check_idempotency,
+)
+from app.config import get_settings
 from app.session import (
     generate_session_token, hash_session_token, create_session,
     validate_session, touch_session, revoke_session, revoke_all_sessions,
@@ -355,6 +364,26 @@ async def send_message(
         update_data["unread"] = conv_data.get("unread", 0) + 1
     
     conv_ref.update(update_data)
+    
+    # If human agent sends a message, deliver it to the customer via their channel
+    if sender_type == "human":
+        channel_type = conv_data.get("channel", "")
+        if channel_type == "telegram":
+            # Get Telegram channel for this seller
+            channel = get_user_channel(db, user_id, "telegram")
+            if channel and channel.get("credentials"):
+                chat_id = conv_data.get("chat_id")
+                if chat_id:
+                    try:
+                        await _send_channel_reply(user_id, chat_id, message.content, channel)
+                        logger.info(f"Human message sent to Telegram chat_id={chat_id} for seller={user_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to send human message to Telegram for seller={user_id}: {e}")
+                else:
+                    logger.warning(f"Telegram conversation missing chat_id for seller={user_id}, conv={conversation_id}")
+            else:
+                logger.warning(f"Telegram channel not configured for seller={user_id}")
+        # Note: WhatsApp/Instagram/Facebook/Website human-to-customer delivery can be added similarly
     
     return new_message
 
@@ -2251,19 +2280,23 @@ async def delete_channel(
 
 @router.post("/channels/whatsapp/setup")
 async def setup_whatsapp_channel(
-    credentials: dict,
+    request: Request,
     current_user: dict = Depends(get_current_user)
 ):
     """
     Set up WhatsApp channel with credentials.
     
-    Credentials must include:
-    - access_token: Meta access token (long-lived)
-    - phone_number_id: WhatsApp Business phone number ID
-    - waba_id: WhatsApp Business Account ID
-    - app_id: Meta app ID
-    - app_secret: Meta app secret
-    - verify_token: Your custom webhook verify token
+    Supports two providers:
+    1. Meta (direct WhatsApp Business API):
+       - access_token: Meta access token (long-lived)
+       - phone_number_id: WhatsApp Business phone number ID
+       - waba_id: WhatsApp Business Account ID
+       - app_id: Meta app ID
+       - app_secret: Meta app secret
+       - verify_token: Custom webhook verify token
+    
+    2. WAGate.app:
+       - api_key: WAGate API key (Bearer token)
     
     All credentials are stored securely in Firebase, never exposed to frontend.
     """
@@ -2272,18 +2305,60 @@ async def setup_whatsapp_channel(
     if not check_team_permission(db, user_id, current_user["uid"], "canManageSettings"):
         raise HTTPException(status_code=403, detail="You do not have permission to perform this action")
     
-    # Validate required fields
-    required_fields = ["access_token", "phone_number_id", "waba_id", "app_secret", "verify_token"]
-    missing = [f for f in required_fields if not credentials.get(f)]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Missing required credentials: {', '.join(missing)}")
-    
-    # Try to get business profile to verify credentials
+    # Parse request body
     try:
-        profile = await whatsapp_service.get_business_profile(credentials)
-        display_name = profile.get("verified_name", "")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to verify WhatsApp credentials: {str(e)}")
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    
+    provider = body.get("provider", "meta")  # "meta" or "wagate"
+    credentials = body.get("credentials", {})
+    
+    if provider not in ("meta", "wagate"):
+        raise HTTPException(status_code=400, detail=f"Invalid provider: {provider}. Must be 'meta' or 'wagate'")
+    
+    if provider == "meta":
+        # Validate Meta credentials
+        required_fields = ["access_token", "phone_number_id", "waba_id", "app_secret", "verify_token"]
+        missing = [f for f in required_fields if not credentials.get(f)]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Missing required Meta credentials: {', '.join(missing)}")
+        
+        # Try to get business profile to verify credentials
+        try:
+            profile = await whatsapp_service.get_business_profile(credentials)
+            display_name = profile.get("verified_name", "")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to verify WhatsApp credentials: {str(e)}")
+        
+        metadata = {
+            "phone_number_id": credentials["phone_number_id"],
+            "waba_id": credentials["waba_id"],
+            "connected_at": __import__("time").time(),
+        }
+        webhook_message = "WhatsApp channel connected. Configure your webhook URL in Meta Business Suite."
+    
+    elif provider == "wagate":
+        # Validate WAGate credentials
+        api_key = credentials.get("api_key", "").strip()
+        if not api_key:
+            raise HTTPException(status_code=400, detail="WAGate API key is required")
+        
+        # WAGate API key format validation (basic)
+        if not api_key.startswith("ag_live_sk_") and not api_key.startswith("ag_test_sk_"):
+            raise HTTPException(status_code=400, detail="Invalid WAGate API key format. Expected format: ag_live_sk_... or ag_test_sk_...")
+        
+        # Note: Full API key validation (without sending a test message) would require
+        # a WAGate health/auth endpoint. Currently WAGate docs don't document one.
+        # Connection state will be confirmed when first message is sent/received.
+        display_name = "WAGate Connected"
+        metadata = {
+            "provider": "wagate",
+            "connected_at": __import__("time").time(),
+        }
+        # Only store the API key in credentials
+        credentials = {"api_key": api_key}
+        webhook_message = "WAGate WhatsApp channel connected. Note: Webhook forwarding must be configured in WAGate dashboard."
     
     # Store credentials securely in Firebase
     now = __import__("time").time()
@@ -2293,23 +2368,20 @@ async def setup_whatsapp_channel(
         "status": ChannelConnectionStatus.CONNECTED.value,
         "displayName": display_name,
         "credentials": credentials,  # Stored securely on backend only
-        "metadata": {
-            "phone_number_id": credentials["phone_number_id"],
-            "waba_id": credentials["waba_id"],
-            "connected_at": now,
-        },
+        "metadata": metadata,
         "lastConnectedAt": now,
     }
     
     result = upsert_user_channel(db, user_id, "whatsapp", channel_data)
     
-    # Build webhook URL for this seller
-    webhook_url = f"{get_settings().webhook_base_url}/webhook/whatsapp/{user_id}"
+    # Build webhook URL for this seller based on provider
+    webhook_path = "/webhook/wagate" if provider == "wagate" else "/webhook/whatsapp"
+    webhook_url = f"{get_settings().webhook_base_url}{webhook_path}/{user_id}"
     
     return {
         "channel": ChannelConnection(**result),
         "webhook_url": webhook_url,
-        "message": "WhatsApp channel connected. Configure your webhook URL in Meta Business Suite."
+        "message": webhook_message
     }
 
 
@@ -2331,6 +2403,68 @@ async def disconnect_whatsapp(
     })
     
     return ChannelConnection(**result)
+
+
+@router.post("/channels/whatsapp/test-send")
+async def test_send_whatsapp(
+    phone: str,
+    message: str = "Hello from ThreadOS",
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Test endpoint to send a WhatsApp message via WAGate.
+    
+    Uses the channel credentials (WAGate API key) if configured,
+    otherwise falls back to the platform-level WAGATE_API_KEY from environment.
+    
+    Args:
+        phone: Recipient phone number (digits only, international format, e.g. 233XXXXXXXXX)
+        message: Message to send (default: "Hello from ThreadOS")
+    
+    Returns:
+        API response with wamid and status on success
+    """
+    db = get_firestore_client()
+    user_id = current_user["uid"]
+    if not check_team_permission(db, user_id, current_user["uid"], "canManageSettings"):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action")
+    
+    # Get WhatsApp channel credentials
+    channel = get_user_channel(db, user_id, "whatsapp")
+    if not channel:
+        raise HTTPException(status_code=404, detail="WhatsApp channel not configured")
+    
+    credentials = channel.get("credentials")
+    metadata = channel.get("metadata") or {}
+    provider = metadata.get("provider", "meta")
+    
+    if provider != "wagate":
+        raise HTTPException(status_code=400, detail="WhatsApp channel is not configured for WAGate provider")
+    
+    if not credentials and not get_settings().wagate_api_key:
+        raise HTTPException(status_code=400, detail="No WAGate API key configured (neither channel nor platform)")
+    
+    try:
+        # Send via WAGate service (uses channel credentials or falls back to platform key)
+        result = await wagate_service.send_text_message(credentials or {}, phone, message)
+        
+        # Log success without exposing API key
+        logger.info(f"Test WhatsApp message sent successfully to {phone[:4]}**** via WAGate (provider: {provider})")
+        
+        return {
+            "status": "sent",
+            "to": phone,
+            "message": message,
+            "wamid": result.get("wamid"),
+            "wagate_status": result.get("status"),
+            "provider": provider
+        }
+    except ValueError as e:
+        logger.error(f"Test WhatsApp send failed (validation): {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Test WhatsApp send failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
 
 
 @router.get("/webhook/whatsapp/{seller_id}")
@@ -2418,6 +2552,732 @@ async def whatsapp_webhook_message(
         return {"status": "error", "message": str(e)}
     
     return {"status": "ok"}
+
+
+# ============================================================
+# TELEGRAM CHANNEL SETUP
+# ============================================================
+
+
+@router.post("/channels/telegram/setup")
+async def setup_telegram_channel(
+    request: Request,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Set up Telegram channel with bot token.
+    
+    The bot token is validated by calling Telegram's getMe API.
+    The webhook is automatically registered with Telegram.
+    
+    Credentials are stored securely in Firebase, never exposed to frontend.
+    """
+    db = get_firestore_client()
+    user_id = current_user["uid"]
+    if not check_team_permission(db, user_id, current_user["uid"], "canManageSettings"):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action")
+    
+    # Parse request body
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    
+    credentials = body.get("credentials", {})
+    
+    # Validate Telegram bot token
+    bot_token = credentials.get("bot_token", "").strip()
+    if not bot_token:
+        raise HTTPException(status_code=400, detail="Telegram bot token is required")
+    
+    # Basic token format validation (Telegram bot tokens are like 123456789:ABC-DEF...)
+    if ":" not in bot_token or len(bot_token.split(":")) != 2:
+        raise HTTPException(status_code=400, detail="Invalid Telegram bot token format")
+    
+    # Validate the token by calling Telegram's getMe API
+    try:
+        is_valid = await telegram_service.validate_bot_token(bot_token)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail="Invalid Telegram bot token. Please check with @BotFather.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Bot token validation failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to validate bot token: {str(e)}")
+    
+    # Get webhook secret from settings
+    webhook_secret = get_settings().telegram_webhook_secret
+    if not webhook_secret:
+        raise HTTPException(status_code=400, detail="TELEGRAM_WEBHOOK_SECRET not configured on server")
+    
+    # Build webhook URL for this seller
+    webhook_url = f"{get_settings().webhook_base_url}/webhook/telegram/{user_id}"
+    
+    # Register webhook with Telegram
+    try:
+        webhook_result = await telegram_service.set_webhook(
+            url=webhook_url,
+            secret_token=webhook_secret,
+            allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post"],
+            drop_pending_updates=True
+        )
+        if not webhook_result.get("ok"):
+            raise HTTPException(status_code=400, detail=f"Failed to set webhook: {webhook_result.get('description', 'Unknown error')}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to set Telegram webhook: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to set webhook: {str(e)}")
+    
+    # Get bot info for display
+    try:
+        bot_info = await telegram_service.get_me()
+        bot_username = bot_info.get("result", {}).get("username", "Unknown")
+        display_name = f"@{bot_username}"
+    except Exception:
+        display_name = "Telegram Bot"
+    
+    # Store credentials securely in Firebase
+    now = __import__("time").time()
+    channel_data = {
+        "type": "telegram",
+        "enabled": True,
+        "status": ChannelConnectionStatus.CONNECTED.value,
+        "displayName": display_name,
+        "credentials": {
+            "bot_token": bot_token,
+            "webhook_secret": get_settings().telegram_webhook_secret,
+        },
+        "metadata": {
+            "provider": "telegram",
+            "bot_username": bot_username,
+            "connected_at": __import__("time").time(),
+        },
+        "lastConnectedAt": now,
+    }
+    
+    result = upsert_user_channel(db, user_id, "telegram", channel_data)
+    
+    return {
+        "channel": ChannelConnection(**result),
+        "webhook_url": webhook_url,
+        "message": f"Telegram bot @{bot_username} connected. Webhook registered."
+    }
+
+
+@router.post("/channels/telegram/disconnect")
+async def disconnect_telegram(
+    current_user: dict = Depends(get_current_user)
+):
+    """Disconnect Telegram channel and clear credentials."""
+    db = get_firestore_client()
+    user_id = current_user["uid"]
+    if not check_team_permission(db, user_id, current_user["uid"], "canManageSettings"):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action")
+    
+    # Delete webhook from Telegram
+    try:
+        channel = get_user_channel(db, user_id, "telegram")
+        if channel and channel.get("credentials", {}).get("bot_token"):
+            await telegram_service.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Failed to delete Telegram webhook: {e}")
+    
+    result = upsert_user_channel(db, user_id, "telegram", {
+        "status": ChannelConnectionStatus.DISCONNECTED.value,
+        "enabled": False,
+        "credentials": None,
+        "lastConnectedAt": None,
+    })
+    
+    return ChannelConnection(**result)
+
+
+# ============================================================
+# TELEGRAM WEBHOOK ENDPOINTS
+# ============================================================
+#
+# These endpoints handle inbound webhook forwarding from WAGate.app
+# WAGate processes WhatsApp messages via Meta Cloud API and forwards
+# events to our backend. This is separate from the direct Meta webhook
+# endpoints above.
+#
+# IMPORTANT: WAGate's external webhook payload format, signature algorithm,
+# headers, and verification flow are NOT YET DOCUMENTED in their public docs.
+# The wagate_webhook module provides adapter interfaces that will be
+# completed once WAGate provides their official specification.
+# ============================================================
+
+
+@router.get("/webhook/wagate/{seller_id}")
+async def wagate_webhook_verify(
+    seller_id: str,
+    request: Request
+):
+    """
+    Webhook verification endpoint for WAGate.app.
+    
+    WAGate may send a GET request to verify the webhook URL during setup.
+    The exact verification flow (query parameters, challenge/response, etc.)
+    is not yet documented in WAGate's public documentation.
+    
+    This endpoint does NOT require Firebase auth (WAGate calls it directly).
+    """
+    return await handle_wagate_webhook_verification(seller_id, request)
+
+
+@router.post("/webhook/wagate/{seller_id}")
+async def wagate_webhook_message(
+    seller_id: str,
+    request: Request
+):
+    """
+    Webhook endpoint for receiving WhatsApp messages forwarded by WAGate.app.
+    
+    This endpoint does NOT require Firebase auth (WAGate calls it directly).
+    Verification is performed via the WAGateWebhookVerifier interface.
+    
+    The WAGate payload parser (WAGatePayloadParser) normalizes WAGate's
+    external format into our internal NormalizedInboundEvent format.
+    """
+    return await handle_wagate_webhook(seller_id, request)
+
+
+# ============================================================
+# TELEGRAM WEBHOOK ENDPOINTS
+# ============================================================
+#
+# These endpoints handle inbound webhook events from Telegram Bot API.
+# Telegram sends updates to this endpoint when users send messages to the bot.
+#
+# ============================================================
+
+
+@router.get("/webhook/telegram/{seller_id}")
+async def telegram_webhook_verify(
+    seller_id: str,
+    request: Request
+):
+    """
+    Webhook verification endpoint for Telegram Bot API.
+    
+    Telegram doesn't use a traditional GET verification like Meta.
+    This endpoint can be used for health checks or manual verification.
+    
+    This endpoint does NOT require Firebase auth (Telegram calls it directly).
+    """
+    # Check if seller has Telegram channel configured
+    db = get_firestore_client()
+    channel = get_user_channel(db, seller_id, "telegram")
+    
+    if not channel or not channel.get("credentials"):
+        logger.warning(f"Telegram webhook verification for unconfigured seller: {seller_id}")
+        raise HTTPException(status_code=404, detail="Telegram channel not configured for this seller")
+    
+    return {
+        "status": "ok",
+        "message": "Telegram webhook endpoint is active",
+        "seller_id": seller_id
+    }
+
+
+@router.post("/webhook/telegram/{seller_id}")
+async def telegram_webhook_message(
+    seller_id: str,
+    request: Request
+):
+    """
+    Webhook endpoint for receiving Telegram messages.
+    
+    This endpoint does NOT require Firebase auth (Telegram calls it directly).
+    Verification is performed via X-Telegram-Bot-Api-Signature header.
+    
+    Expected update types: message, edited_message, channel_post, etc.
+    """
+    return await handle_telegram_webhook(seller_id, request)
+
+
+async def handle_telegram_webhook(
+    seller_id: str,
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Main entry point for Telegram webhook processing.
+    
+    This function:
+    1. Reads raw request body
+    2. Looks up seller's Telegram channel
+    3. Verifies webhook signature (X-Telegram-Bot-Api-Signature)
+    4. Parses JSON payload
+    5. Extracts event ID for idempotency
+    6. Normalizes and processes incoming messages
+    6. Returns appropriate HTTP response
+    
+    Args:
+        seller_id: The seller's user ID from URL path
+        request: FastAPI Request object
+        
+    Returns:
+        Response dict with status
+    """
+    start_time = time.time()
+    
+    # 1. Read raw body for signature verification
+    try:
+        body = await request.body()
+    except Exception as e:
+        logger.error(f"Failed to read request body: {e}")
+        raise HTTPException(status_code=400, detail="Unable to read request body")
+    
+    if not body:
+        logger.warning(f"Empty Telegram webhook body for seller: {seller_id}")
+        raise HTTPException(status_code=400, detail="Empty request body")
+    
+    # 2. Look up seller's Telegram channel
+    db = get_firestore_client()
+    channel = get_user_channel(db, seller_id, "telegram")
+    if not channel:
+        logger.warning(f"Telegram webhook for unknown seller: {seller_id}")
+        # Return 200 to avoid Telegram retries for unknown sellers
+        return {"status": "ok", "message": "Seller not found"}
+    
+    logger.info(f"  channel found: {channel.get('id')}, provider: {channel.get('metadata', {}).get('provider')}")
+    
+    if not channel.get("credentials"):
+        logger.warning(f"Telegram webhook for seller without credentials: {seller_id}")
+        return {"status": "ok", "message": "Channel not configured"}
+    
+    # Verify this is a Telegram channel
+    metadata = channel.get("metadata") or {}
+    if metadata.get("provider") != "telegram":
+        logger.info(f"Telegram webhook received but seller uses different provider: {seller_id}")
+        return {"status": "ok", "message": "Not a Telegram channel"}
+    
+# 3. Verify webhook secret token
+    secret_token = channel.get("credentials", {}).get("webhook_secret")
+    if not secret_token:
+        logger.error(f"No webhook secret configured for Telegram channel: {seller_id}")
+        raise HTTPException(status_code=403, detail="Webhook secret not configured")
+
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not telegram_service.verify_webhook_secret(secret_header, secret_token):
+        logger.warning(f"Telegram webhook verification failed for seller: {seller_id}")
+        raise HTTPException(status_code=403, detail="Invalid secret token")
+
+    logger.info(f"  secret token verification: PASSED")
+    
+    # 4. Parse JSON payload
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in Telegram webhook for seller {seller_id}: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except Exception as e:
+        logger.error(f"Failed to decode Telegram webhook body: {e}")
+        raise HTTPException(status_code=400, detail="Invalid request body")
+    
+    # DEBUG: Log parsed payload structure
+    logger.info(f"  parsed payload keys: {list(payload.keys())}")
+    if "update_id" in payload:
+        logger.info(f"  update_id: {payload.get('update_id')}")
+    if "message" in payload:
+        msg = payload["message"]
+        logger.info(f"  message: id={msg.get('message_id')}, from={msg.get('from', {}).get('id')}, chat={msg.get('chat', {}).get('id')}, text={msg.get('text', '')[:50]}")
+    elif "edited_message" in payload:
+        msg = payload["edited_message"]
+        logger.info(f"  edited_message: id={msg.get('message_id')}, chat={msg.get('chat', {}).get('id')}")
+    
+    # 5. Idempotency check (use update_id)
+    event_id = str(payload.get("update_id", ""))
+    if event_id:
+        event_id = f"{seller_id}:{event_id}"
+        if not _check_idempotency(event_id):
+            logger.info(f"  duplicate event ignored: {event_id}")
+            return {"status": "ok", "message": "Duplicate event ignored"}
+    
+    logger.info(f"Processing Telegram webhook for seller {seller_id}, update_id={event_id}")
+    
+    # 6. Parse and normalize inbound messages
+    try:
+        normalized_events = _parse_telegram_update(payload, seller_id)
+        logger.info(f"  parser returned {len(normalized_events)} normalized events")
+        for idx, event in enumerate(normalized_events):
+            logger.info(f"    event[{idx}]: id={event.external_message_id}, from={event.from_phone}, type={event.message_type}, text_len={len(event.text)}")
+    except Exception as e:
+        logger.error(f"Telegram payload parse error for seller {seller_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"status": "error", "message": f"Payload parse error: {e}"}
+    
+    # 7. Process each normalized inbound message
+    processed_count = 0
+    for event in normalized_events:
+        try:
+            logger.info(f"  processing event: {event.external_message_id}")
+            await _process_normalized_telegram_event(event, channel)
+            processed_count += 1
+            logger.info(f"  event {event.external_message_id} processed successfully")
+        except Exception as e:
+            logger.error(f"Failed to process normalized event {event.external_message_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # Continue processing other events
+    
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    logger.info(f"=== TELEGRAM WEBHOOK COMPLETE: seller={seller_id}, processed={processed_count}, time={elapsed_ms}ms ===")
+    
+    return {"status": "ok", "processed": processed_count}
+
+
+def _parse_telegram_update(
+    payload: Dict[str, Any],
+    seller_id: str
+) -> List[NormalizedInboundEvent]:
+    """
+    Parse Telegram update payload into normalized events.
+    
+    Handles message types: text, photo, document, audio, video, sticker, etc.
+    Ignores unsupported update types (callback_query, inline_query, etc.)
+    """
+    events: List[NormalizedInboundEvent] = []
+    
+    # Handle regular messages
+    if "message" in payload:
+        msg = payload["message"]
+        event = _normalize_telegram_message(msg, seller_id, payload)
+        if event:
+            events.append(event)
+    
+    # Handle edited messages
+    if "edited_message" in payload:
+        msg = payload["edited_message"]
+        event = _normalize_telegram_message(msg, seller_id, payload)
+        if event:
+            events.append(event)
+    
+    # Handle channel posts (if bot is admin in channel)
+    if "channel_post" in payload:
+        msg = payload["channel_post"]
+        event = _normalize_telegram_message(msg, seller_id, payload)
+        if event:
+            events.append(event)
+    
+    # Handle edited channel posts
+    if "edited_channel_post" in payload:
+        msg = payload["edited_channel_post"]
+        event = _normalize_telegram_message(msg, seller_id, payload)
+        if event:
+            events.append(event)
+    
+    # Note: We ignore callback_query, inline_query, chosen_inline_result,
+    # shipping_query, pre_checkout_query, poll, poll_answer, my_chat_member,
+    # chat_member, chat_join_request as they require different handling
+    
+    return events
+
+
+def _normalize_telegram_message(
+    message: Dict[str, Any],
+    seller_id: str,
+    value_context: Dict[str, Any]
+) -> Optional[NormalizedInboundEvent]:
+    """
+    Normalize a single Telegram message to our internal format.
+    
+    Args:
+        message: Individual message object from Telegram update
+        seller_id: The seller's user ID
+        value_context: The parent update object for context
+        
+    Returns:
+        NormalizedInboundEvent or None if message cannot be processed
+    """
+    # Extract required fields
+    external_message_id = str(message.get("message_id", ""))
+    from_user = message.get("from", {})
+    from_id = str(from_user.get("id", ""))
+    chat = message.get("chat", {})
+    chat_id = str(chat.get("id", ""))
+    message_type = "text"  # Default, will be updated based on content
+    timestamp = str(message.get("date", int(__import__("time").time())))
+    
+    if not external_message_id or not from_id or not chat_id:
+        logger.warning(f"Message missing required fields for seller {seller_id}: {message}")
+        return None
+    
+    # Extract text content based on message content
+    text = ""
+    if "text" in message:
+        message_type = "text"
+        text = message.get("text", "")
+    elif "photo" in message:
+        message_type = "photo"
+        # Get caption if available
+        text = message.get("caption", "[Photo received]")
+    elif "document" in message:
+        message_type = "document"
+        doc = message["document"]
+        text = message.get("caption", f"[Document: {doc.get('file_name', 'file')}]")
+    elif "audio" in message:
+        message_type = "audio"
+        text = message.get("caption", "[Audio received]")
+    elif "video" in message:
+        message_type = "video"
+        text = message.get("caption", "[Video received]")
+    elif "voice" in message:
+        message_type = "voice"
+        text = "[Voice message received]"
+    elif "video_note" in message:
+        message_type = "video_note"
+        text = "[Video note received]"
+    elif "sticker" in message:
+        message_type = "sticker"
+        sticker = message["sticker"]
+        text = f"[Sticker: {sticker.get('emoji', '😀')}]"
+    elif "location" in message:
+        message_type = "location"
+        loc = message["location"]
+        text = f"[Location: {loc.get('latitude')}, {loc.get('longitude')}]"
+    elif "contact" in message:
+        message_type = "contact"
+        contact = message["contact"]
+        text = f"[Contact: {contact.get('first_name', '')} {contact.get('last_name', '')}]"
+    else:
+        message_type = "unknown"
+        text = f"[{message_type.title()} message]"
+    
+    if not text:
+        logger.debug(f"Empty text content for message {external_message_id}, type={message_type}")
+        text = f"[{message_type.title()} received]"
+    
+    # For Telegram, the "to" is the chat_id, "from" is the user_id
+    return NormalizedInboundEvent(
+        seller_id=seller_id,
+        external_message_id=external_message_id,
+        from_phone=from_id,      # Telegram user ID
+        to_phone=chat_id,        # Telegram chat ID
+        message_type=message_type,
+        text=text,
+        timestamp=timestamp,
+        raw_event=message
+    )
+
+
+async def _process_normalized_telegram_event(
+    event: NormalizedInboundEvent,
+    channel: Dict[str, Any]
+) -> None:
+    """
+    Process a normalized Telegram event through the existing pipeline.
+    
+    This reuses the existing conversation/customer/AI logic.
+    """
+    import traceback
+    from datetime import datetime
+    import zoneinfo
+    import time as time_module
+    from app.firebase import get_firestore_client
+    from app.routes import (
+        _find_or_create_customer_by_telegram_id,
+        _find_or_create_conversation,
+        _send_channel_reply,
+        get_user_ai_settings,
+        get_user_customer_settings,
+        get_user_knowledge_settings,
+        get_user_products,
+        get_user_business_info,
+        _get_seller_general,
+    )
+    from app.models import MessageBase, ChatRequest
+    from app.agent import agent
+    
+    seller_id = event.seller_id
+    from_id = event.from_phone
+    message_id = event.external_message_id
+    message_type = event.message_type
+    text = event.text
+    timestamp = event.timestamp
+    
+    def log_stage(stage: str, success: bool = True, error: str = None, **extra):
+        """Structured logging for each pipeline stage."""
+        log_data = {
+            "stage": stage,
+            "seller_id": seller_id,
+            "chat_id": from_id,
+            "message_id": message_id,
+            "success": success,
+        }
+        log_data.update(extra)
+        if success:
+            logger.info(f"[TELEGRAM PIPELINE] {stage} OK | {log_data}")
+        else:
+            logger.error(f"[TELEGRAM PIPELINE] {stage} FAILED | {log_data} | error={error}")
+            if error:
+                logger.error(f"[TELEGRAM PIPELINE] {stage} TRACEBACK: {traceback.format_exc()}")
+    
+    if not text:
+        log_stage("validate_message", success=False, error="Empty text content")
+        return
+    
+    log_stage("message_received", text_preview=text[:50], message_type=message_type)
+    
+    db = get_firestore_client()
+    
+    # STAGE 2: Customer lookup/create
+    try:
+        log_stage("customer_lookup_start", from_id=from_id)
+        customer = _find_or_create_customer_by_telegram_id(db, seller_id, from_id, event.raw_event)
+        log_stage("customer_lookup_done", customer_id=customer.get("id"), customer_name=customer.get("name"))
+    except Exception as e:
+        log_stage("customer_lookup", success=False, error=str(e))
+        raise
+    
+    # STAGE 3: Conversation lookup/create
+    try:
+        log_stage("conversation_lookup_start", chat_id=event.to_phone)
+        conversation = _find_or_create_conversation(
+            db, seller_id, customer, "telegram", chat_id=event.to_phone
+        )
+        log_stage("conversation_lookup_done", conversation_id=conversation.get("id"), channel=conversation.get("channel"))
+    except Exception as e:
+        log_stage("conversation_lookup", success=False, error=str(e))
+        raise
+    
+    conv_id = conversation["id"]
+    
+    # STAGE 4: Save incoming customer message
+    try:
+        log_stage("save_customer_message_start", conv_id=conv_id)
+        now = time_module.time()
+        try:
+            general = _get_seller_general(db, seller_id)
+            tz = zoneinfo.ZoneInfo(general.get("timezone", "Africa/Accra"))
+            time_str = datetime.now(tz).strftime("%I:%M %p")
+        except Exception:
+            time_str = datetime.now().strftime("%I:%M %p")
+        
+        new_message = {
+            "id": int(now * 1000),
+            "sender": "customer",
+            "content": text,
+            "time": time_str,
+            "external_id": message_id,
+        }
+        
+        conv_ref = db.collection("users").document(seller_id).collection("conversations").document(conv_id)
+        conv_doc = conv_ref.get()
+        conv_data = conv_doc.to_dict() if conv_doc.exists else {}
+        
+        messages = conv_data.get("messages", [])
+        messages.append(new_message)
+        
+        conv_ref.update({
+            "messages": messages,
+            "lastMessage": text,
+            "time": time_str,
+            "updatedAt": now,
+            "unread": conv_data.get("unread", 0) + 1,
+        })
+        log_stage("save_customer_message_done", message_count=len(messages))
+    except Exception as e:
+        log_stage("save_customer_message", success=False, error=str(e))
+        raise
+    
+    # STAGE 5: Update customer last interaction
+    try:
+        customer_ref = db.collection("users").document(seller_id).collection("customers").document(customer["id"])
+        customer_ref.update({
+            "lastInteraction": f"Telegram: {text[:50]}...",
+            "updatedAt": now,
+        })
+        log_stage("update_customer_interaction_done")
+    except Exception as e:
+        log_stage("update_customer_interaction", success=False, error=str(e))
+        # Non-fatal, continue
+    
+    # STAGE 6: Get settings
+    try:
+        ai_settings = get_user_ai_settings(db, seller_id)
+        customer_settings = get_user_customer_settings(db, seller_id)
+        knowledge_settings = get_user_knowledge_settings(db, seller_id)
+        
+        if not customer_settings.get("showProductRecommendations", True):
+            ai_settings["productRecommendations"] = False
+        ai_settings["showAvailability"] = customer_settings.get("showAvailability", True)
+        log_stage("settings_loaded", ai_enabled=ai_settings.get("enabled"), auto_reply=ai_settings.get("autoReply"), mode=conv_data.get("mode"))
+    except Exception as e:
+        log_stage("load_settings", success=False, error=str(e))
+        raise
+    
+    # STAGE 7: Check if AI should respond
+    if conv_data.get("mode") == "ai" and ai_settings.get("enabled") and ai_settings.get("autoReply"):
+        log_stage("ai_should_respond", success=True)
+        
+        # STAGE 8: Generate AI response
+        try:
+            log_stage("ai_generate_start")
+            products = get_user_products(db, seller_id)
+            business_info = get_user_business_info(db, seller_id)
+            
+            history = []
+            for msg in messages[-6:]:
+                history.append(MessageBase(
+                    id=msg.get("id"),
+                    sender=msg.get("sender", "customer"),
+                    content=msg.get("content", ""),
+                    time=msg.get("time", ""),
+                ))
+            
+            chat_request = ChatRequest(
+                message=text,
+                conversationId=conv_id,
+                conversationHistory=history,
+            )
+            
+            ai_response = await agent.generate_response(chat_request, products, business_info, ai_settings, knowledge_settings)
+            log_stage("ai_generate_done", response_len=len(ai_response.response), intent=ai_response.intent, confidence=ai_response.confidence, requires_handoff=ai_response.requiresHandoff)
+            
+            # STAGE 9: Save AI response to conversation
+            try:
+                ai_message = {
+                    "id": int((time_module.time()) * 1000),
+                    "sender": "ai",
+                    "content": ai_response.response,
+                    "time": time_str,
+                }
+                
+                messages.append(ai_message)
+                conv_ref.update({
+                    "messages": messages,
+                    "lastMessage": ai_response.response,
+                    "time": time_str,
+                    "updatedAt": time_module.time(),
+                })
+                log_stage("save_ai_response_done", message_count=len(messages))
+            except Exception as e:
+                log_stage("save_ai_response", success=False, error=str(e))
+                raise
+            
+            # STAGE 10: Send AI response back via Telegram
+            try:
+                log_stage("send_telegram_reply_start", chat_id=event.to_phone)
+                await _send_channel_reply(seller_id, event.to_phone, ai_response.response, channel)
+                log_stage("send_telegram_reply_done")
+            except Exception as e:
+                log_stage("send_telegram_reply", success=False, error=str(e))
+                raise
+                
+        except Exception as e:
+            log_stage("ai_generate", success=False, error=str(e))
+            # Send fallback message
+            fallback = "I'm having trouble processing your request. Please try again later."
+            try:
+                await _send_channel_reply(seller_id, event.to_phone, fallback, channel)
+                log_stage("fallback_sent")
+            except Exception as fallback_e:
+                log_stage("fallback_send", success=False, error=str(fallback_e))
+    else:
+        log_stage("ai_should_respond", success=False, reason=f"mode={conv_data.get('mode')}, ai_enabled={ai_settings.get('enabled')}, auto_reply={ai_settings.get('autoReply')}")
 
 
 async def _process_whatsapp_webhook(
@@ -2588,14 +3448,21 @@ async def _send_whatsapp_reply(
     message: str,
     channel: dict
 ):
-    """Send a reply message via WhatsApp."""
+    """Send a reply message via WhatsApp using the appropriate provider service."""
     credentials = channel.get("credentials")
     if not credentials:
         logger.error(f"No WhatsApp credentials for seller: {seller_id}")
         return
     
+    # Determine provider from metadata (default to "meta" for backward compatibility)
+    metadata = channel.get("metadata") or {}
+    provider = metadata.get("provider", "meta")
+    
     try:
-        await whatsapp_service.send_text_message(credentials, phone, message)
+        if provider == "wagate":
+            await wagate_service.send_text_message(credentials, phone, message)
+        else:
+            await whatsapp_service.send_text_message(credentials, phone, message)
     except ValueError as e:
         # Token expired or invalid
         logger.error(f"WhatsApp send failed (token issue): {e}")
@@ -2611,6 +3478,106 @@ async def _send_whatsapp_reply(
         })
     except Exception as e:
         logger.error(f"WhatsApp send failed: {e}")
+
+
+async def _send_channel_reply(
+    seller_id: str,
+    to_identifier: str,
+    message: str,
+    channel: dict
+):
+    """
+    Send a reply message via the appropriate channel provider.
+    
+    Routes to the appropriate service based on channel metadata.provider.
+    """
+    credentials = channel.get("credentials")
+    if not credentials:
+        logger.error(f"No credentials for seller: {seller_id}")
+        return
+    
+    metadata = channel.get("metadata") or {}
+    provider = metadata.get("provider", "meta")
+    
+    try:
+        if provider == "telegram":
+            await telegram_service.send_text_message(to_identifier, message)
+        elif provider == "wagate":
+            await wagate_service.send_text_message(credentials, to_identifier, message)
+        else:
+            await whatsapp_service.send_text_message(credentials, to_identifier, message)
+    except ValueError as e:
+        # Token expired or invalid
+        logger.error(f"Send failed (token issue) for provider {provider}: {e}")
+        # Mark channel as disconnected
+        db = get_firestore_client()
+        upsert_user_channel(db, seller_id, "whatsapp", {
+            "status": ChannelConnectionStatus.DISCONNECTED.value,
+            "metadata": {
+                **(channel.get("metadata") or {}),
+                "lastError": str(e),
+                "errorAt": __import__("time").time(),
+            },
+        })
+    except Exception as e:
+        logger.error(f"Send failed for provider {provider}: {e}")
+
+
+def _find_or_create_customer_by_telegram_id(db, seller_id: str, telegram_user_id: str, raw_event: dict = None) -> dict:
+    """Find or create a customer by Telegram user ID."""
+    customers_ref = db.collection("users").document(seller_id).collection("customers")
+    
+    # Search by telegram_id
+    query = customers_ref.where("telegram_id", "==", telegram_user_id)
+    docs = list(query.stream())
+    
+    if docs:
+        data = docs[0].to_dict()
+        data["id"] = docs[0].id
+        return data
+    
+    # Also check by phone in case they're linked
+    phone = ""
+    if raw_event and "from" in raw_event:
+        # Telegram doesn't always provide phone, but we can store telegram_id
+        pass
+    
+    # Create new customer
+    now = __import__("time").time()
+    from_user = raw_event.get("from", {}) if raw_event else {}
+    name = f"Telegram User {telegram_user_id[-4:]}" if len(telegram_user_id) >= 4 else f"Telegram User {telegram_user_id}"
+    initials = from_user.get("first_name", "TU")[:2].upper() if from_user.get("first_name") else "TU"
+    
+    customer_data = {
+        "name": name,
+        "initials": initials,
+        "phone": "",
+        "telegram_id": telegram_user_id,
+        "telegram_username": raw_event.get("from", {}).get("username", "") if raw_event else "",
+        "telegram_first_name": raw_event.get("from", {}).get("first_name", "") if raw_event else "",
+        "telegram_last_name": raw_event.get("from", {}).get("last_name", "") if raw_event else "",
+        "email": "",
+        "location": "",
+        "status": "New",
+        "channel": "Telegram",
+        "orders": 0,
+        "totalSpent": 0.0,
+        "conversations": 0,
+        "lastInteraction": "",
+        "joined": datetime.now().strftime("%B %d, %Y"),
+        "notes": "",
+        "products": [],
+        "ordersList": [],
+        "conversationsList": [],
+        "online": False,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    
+    doc_ref = customers_ref.document()
+    doc_ref.set(customer_data)
+    customer_data["id"] = doc_ref.id
+    return customer_data
 
 
 def _find_or_create_customer_by_phone(db, seller_id: str, phone: str) -> dict:
@@ -2660,7 +3627,7 @@ def _find_or_create_customer_by_phone(db, seller_id: str, phone: str) -> dict:
 
 
 def _find_or_create_conversation(
-    db, seller_id: str, customer: dict, channel: str, phone: str
+    db, seller_id: str, customer: dict, channel: str, phone: str = "", chat_id: str = ""
 ) -> dict:
     """Find or create a conversation for a customer on a channel."""
     convs_ref = db.collection("users").document(seller_id).collection("conversations")
@@ -2669,20 +3636,27 @@ def _find_or_create_conversation(
     query = convs_ref.where("channel", "==", channel)
     docs = list(query.stream())
     
+    identifier = chat_id if chat_id else phone
+    
     for doc in docs:
         data = doc.to_dict()
-        if data.get("phone") == phone and data.get("conversationStatus") in ("open", "handed_off"):
+        # Match by chat_id for Telegram, phone for WhatsApp
+        if chat_id and data.get("chat_id") == chat_id:
+            data["id"] = doc.id
+            return data
+        if not chat_id and data.get("phone") == phone:
             data["id"] = doc.id
             return data
     
     # Create new conversation
     now = __import__("time").time()
     conv_data = {
-        "name": customer.get("name", f"Customer {phone[-4:]}"),
+        "name": customer.get("name", f"Customer {identifier[-4:]}"),
         "initials": customer.get("initials", "CU"),
         "status": "online",
         "channel": channel,
         "phone": phone,
+        "chat_id": chat_id,
         "email": customer.get("email", ""),
         "location": customer.get("location", ""),
         "lastMessage": "",

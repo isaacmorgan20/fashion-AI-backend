@@ -4,12 +4,30 @@ from contextlib import asynccontextmanager
 from app.config import get_settings
 from app.firebase import initialize_firebase
 from app.routes import router as api_router
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     initialize_firebase()
+    
+    # Verify CORS configuration
+    settings = get_settings()
+    cors_origins = [settings.frontend_url, "http://localhost:5173", "http://127.0.0.1:5173"]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_origins = []
+    for origin in cors_origins:
+        if origin not in seen:
+            seen.add(origin)
+            unique_origins.append(origin)
+    
+    logger.info(f"CORS enabled for origins: {unique_origins}")
+    logger.info(f"Frontend URL from config: {settings.frontend_url}")
+    
     yield
     # Shutdown (if needed)
 

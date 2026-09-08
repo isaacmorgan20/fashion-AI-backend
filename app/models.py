@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Literal
 from datetime import datetime
 from enum import Enum
@@ -220,6 +220,21 @@ class ConversationBase(BaseModel):
     orders: List[dict] = []
     productsDiscussed: List[str] = []
     messages: List[MessageBase] = []
+
+    @field_validator("channel", mode="before")
+    @classmethod
+    def normalize_channel(cls, v):
+        """Normalize channel value to match Channel enum (case-insensitive)."""
+        if isinstance(v, str):
+            mapping = {
+                "whatsapp": "WhatsApp",
+                "instagram": "Instagram",
+                "facebook": "Facebook",
+                "website": "Website",
+                "telegram": "Telegram",
+            }
+            return mapping.get(v.lower(), v)
+        return v
 
 
 class ConversationCreate(BaseModel):

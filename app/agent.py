@@ -1,25 +1,72 @@
 import json
+import logging
 import re
-from typing import List, Dict, Any, Optional
+import asyncio
+from typing import List, Dict, Any, Optional, Callable, TypeVar
 from app.config import get_settings
 from app.models import ProductBase, MessageBase, SenderType, AIResponse, ChatRequest
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar('T')
+
+async def _retry_with_backoff(func: Callable[[], T], max_retries: int = 3, base_delay: float = 1.0) -> T:
+    """Retry a function with exponential backoff for rate limit errors."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            if asyncio.iscoroutinefunction(func):
+                return await func()
+            else:
+                return func()
+        except Exception as e:
+            last_exception = e
+            # Check if it's a rate limit error (429)
+            error_str = str(e).lower()
+            is_rate_limit = (
+                "429" in error_str or 
+                "rate limit" in error_str or 
+                "quota exceeded" in error_str or
+                "resource_exhausted" in error_str or
+                "too many requests" in error_str
+            )
+            if is_rate_limit and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f"[AI AGENT] Rate limit hit (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+                await asyncio.sleep(delay)
+                continue
+            # Not a rate limit error, or max retries reached
+            raise
+    raise last_exception
 
 
 class ThreadOSAgent:
     def __init__(self):
         self.settings = get_settings()
         self.client = None
+        self.model = None
         if self.settings.google_ai_api_key:
+            # Use new google.genai package with v1 API (not v1beta)
             try:
                 from google import genai
-                self.client = genai.Client(api_key=self.settings.google_ai_api_key)
+                self.client = genai.Client(
+                    api_key=self.settings.google_ai_api_key,
+                    http_options={"api_version": "v1"}
+                )
             except ImportError:
-                # Fallback to deprecated package
-                import google.generativeai as genai
-                genai.configure(api_key=self.settings.google_ai_api_key)
-                self.model = genai.GenerativeModel(self.settings.ai_model)
+                # Fallback to deprecated google.generativeai package
+                try:
+                    import google.generativeai as genai
+                    genai.configure(api_key=self.settings.google_ai_api_key)
+                    self.model = genai.GenerativeModel(self.settings.ai_model)
+                except ImportError:
+                    pass
         else:
             self.model = None
+
+    async def _generate_with_retry(self, func: Callable[[], T]) -> T:
+        """Generate content with retry logic for rate limits."""
+        return await _retry_with_backoff(func, max_retries=3, base_delay=1.5)
 
     def _get_system_prompt(self, products: List[ProductBase], business_info: Dict[str, Any], ai_settings: Optional[Dict[str, Any]] = None, knowledge_settings: Optional[Dict[str, Any]] = None) -> str:
         ai_settings = ai_settings or {}
@@ -255,27 +302,39 @@ Return JSON with:
 
         try:
             if self.client:
-                # Use new google.genai client
-                response = self.client.models.generate_content(
-                    model=self.settings.ai_model,
-                    contents=full_prompt,
-                    config={
-                        "temperature": self.settings.ai_temperature,
-                        "max_output_tokens": self.settings.ai_max_tokens,
-                    }
+                # Use new google.genai client with retry for rate limits
+                logger.info(f"[AI AGENT] Calling new google.genai client with model={self.settings.ai_model}")
+                response = await self._generate_with_retry(
+                    lambda: self.client.models.generate_content(
+                        model=self.settings.ai_model,
+                        contents=full_prompt,
+                        config={
+                            "temperature": self.settings.ai_temperature,
+                            "max_output_tokens": self.settings.ai_max_tokens,
+                        }
+                    )
                 )
                 response_text = response.text
+                logger.info(f"[AI AGENT] New client response received, len={len(response_text)}")
+                logger.debug(f"[AI AGENT] Response text preview: {response_text[:200]}")
             else:
-                # Fallback to deprecated package
-                response = self.model.generate_content(
-                    full_prompt,
-                    generation_config={
-                        "temperature": self.settings.ai_temperature,
-                        "max_output_tokens": self.settings.ai_max_tokens,
-                    }
+                # Fallback to deprecated package with retry
+                logger.info(f"[AI AGENT] Calling deprecated google.generativeai with model={self.settings.ai_model}")
+                response = await self._generate_with_retry(
+                    lambda: self.model.generate_content(
+                        full_prompt,
+                        generation_config={
+                            "temperature": self.settings.ai_temperature,
+                            "max_output_tokens": self.settings.ai_max_tokens,
+                        }
+                    )
                 )
                 response_text = response.text
+                logger.info(f"[AI AGENT] Deprecated package response received, len={len(response_text)}")
+                logger.debug(f"[AI AGENT] Response text preview: {response_text[:200]}")
+            logger.info(f"[AI AGENT] Parsing response...")
             ai_resp = self._parse_ai_response(response_text)
+            logger.info(f"[AI AGENT] Parsed response: intent={ai_resp.intent}, confidence={ai_resp.confidence}, requires_handoff={ai_resp.requiresHandoff}, response_len={len(ai_resp.response)}")
             # Enforce AI settings - real business logic
             # Product recommendations OFF → strip product mentions
             if ai_settings.get("productRecommendations") is False:
@@ -310,6 +369,20 @@ Return JSON with:
                     ai_resp.handoffReason = f"Low confidence ({ai_resp.confidence:.2f} < {thresh}) - confidence threshold {ai_settings.get('confidenceThreshold','Medium')}"
             return ai_resp
         except Exception as e:
+            import traceback
+            logger.error(f"[AI AGENT] Generation failed: {e}")
+            logger.error(f"[AI AGENT] Traceback: {traceback.format_exc()}")
+            
+            # Check if it's a rate limit error
+            error_str = str(e).lower()
+            is_rate_limit = (
+                "429" in error_str or 
+                "rate limit" in error_str or 
+                "quota exceeded" in error_str or
+                "resource_exhausted" in error_str or
+                "too many requests" in error_str
+            )
+            
             # Respect Human handoff OFF even on error
             if ai_settings.get("humanHandoff") is False:
                 return AIResponse(
@@ -319,6 +392,17 @@ Return JSON with:
                     requiresHandoff=False,
                     handoffReason=None
                 )
+            
+            if is_rate_limit:
+                # For rate limits, don't handoff - just ask to retry
+                return AIResponse(
+                    response="I'm temporarily unable to process your request due to high demand. Please try again in a moment.",
+                    intent="error",
+                    confidence=0.0,
+                    requiresHandoff=False,
+                    handoffReason="Rate limit exceeded"
+                )
+            
             return AIResponse(
                 response="I'm having trouble processing your request. Let me connect you with a human agent.",
                 intent="error",

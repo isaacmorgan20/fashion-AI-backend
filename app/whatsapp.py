@@ -251,5 +251,92 @@ class WhatsAppService:
             return None
 
 
+# ============================================================
+# WAGate.app WhatsApp API Service
+# ============================================================
+
+class WAGateService:
+    """Service for WAGate.app WhatsApp API operations.
+    
+    WAGate is a platform built on top of Meta's WhatsApp Cloud API.
+    It handles the Meta connection and exposes a simpler REST API.
+    """
+    
+    def __init__(self):
+        self.settings = get_settings()
+        self.base_url = self.settings.wagate_base_url.rstrip("/")
+        # Platform-level API key for testing (set via WAGATE_API_KEY env var)
+        self.platform_api_key = self.settings.wagate_api_key
+    
+    async def send_text_message(
+        self,
+        credentials: dict,
+        to_phone: str,
+        message: str
+    ) -> Dict[str, Any]:
+        """
+        Send a text message via WAGate.app API.
+        
+        Args:
+            credentials: Channel credentials with api_key (seller-specific)
+            to_phone: Recipient's phone number (digits only, international format, e.g. 15551234567)
+            message: Text message to send
+            
+        Returns:
+            API response dict with wamid and status on success
+            
+        Raises:
+            ValueError: If API key not configured or WAGate returns an error
+        """
+        api_key = credentials.get("api_key") if credentials else None
+        # Fall back to platform API key for testing
+        if not api_key:
+            api_key = self.platform_api_key
+        if not api_key:
+            raise ValueError("WAGate API key not configured")
+        
+        url = f"{self.base_url}/api/messages.php"
+        
+        payload = {
+            "to": to_phone,
+            "type": "text",
+            "body": message
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers, timeout=30)
+            
+            # Handle WAGate-specific error codes
+            if response.status_code != 200:
+                try:
+                    error_data = response.json()
+                    error_message = error_data.get("error", response.text)
+                    error_code = error_data.get("code", response.status_code)
+                except Exception:
+                    error_message = response.text
+                    error_code = response.status_code
+                
+                if response.status_code == 401:
+                    raise ValueError("WAGate API key is invalid, missing, or revoked. Please reconnect.")
+                elif response.status_code == 403:
+                    raise ValueError("WAGate API access not included in your plan. Upgrade to Growth or Scale.")
+                elif response.status_code == 409:
+                    raise ValueError("No active WhatsApp connection on the WAGate workspace.")
+                elif response.status_code == 422:
+                    raise ValueError(f"Invalid request: {error_message}")
+                elif response.status_code == 502:
+                    raise ValueError("Upstream error from WhatsApp Cloud API. Please try again later.")
+                else:
+                    raise ValueError(f"WAGate API error ({error_code}): {error_message}")
+            
+            return response.json()
+
+
 # Singleton instance
 whatsapp_service = WhatsAppService()
+wagate_service = WAGateService()
