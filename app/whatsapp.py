@@ -214,6 +214,77 @@ class WhatsAppService:
                 return response.json()
             return {}
     
+    async def send_image_message(
+        self,
+        credentials: dict,
+        to_phone: str,
+        image_url: str,
+        caption: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Send an image message via WhatsApp Business API.
+        
+        Args:
+            credentials: Channel credentials with access_token and phone_number_id
+            to_phone: Recipient's phone number (with country code, no + prefix)
+            image_url: Publicly accessible image URL (HTTPS)
+            caption: Optional caption for the image
+            
+        Returns:
+            API response dict with message ID on success
+        """
+        access_token = self.get_access_token(credentials)
+        phone_number_id = self.get_phone_number_id(credentials)
+        
+        if not access_token:
+            raise ValueError("WhatsApp access token not configured")
+        if not phone_number_id:
+            raise ValueError("WhatsApp phone number ID not configured")
+        if not image_url:
+            raise ValueError("Image URL is required")
+        
+        # Validate URL is HTTPS
+        if not image_url.startswith("https://"):
+            raise ValueError("Image URL must be HTTPS for WhatsApp delivery")
+        
+        url = f"{WHATSAPP_BASE_URL}/{phone_number_id}/messages"
+        
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_phone,
+            "type": "image",
+            "image": {
+                "link": image_url
+            }
+        }
+        
+        if caption:
+            payload["image"]["caption"] = caption
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers, timeout=30)
+            
+            if response.status_code != 200:
+                error_data = response.json().get("error", {})
+                error_message = error_data.get("message", response.text)
+                error_code = error_data.get("code", response.status_code)
+                
+                if error_code == 190:
+                    raise ValueError("WhatsApp access token has expired or is invalid. Please reconnect.")
+                elif error_code == 131047:
+                    raise ValueError("Recipient phone number is not on WhatsApp.")
+                elif error_code == 131026:
+                    raise ValueError("Message failed to send. Rate limit exceeded or invalid request.")
+                else:
+                    raise ValueError(f"WhatsApp API error ({error_code}): {error_message}")
+            
+            return response.json()
+    
     async def refresh_access_token(
         self,
         credentials: dict
@@ -312,6 +383,82 @@ class WAGateService:
             response = await client.post(url, json=payload, headers=headers, timeout=30)
             
             # Handle WAGate-specific error codes
+            if response.status_code != 200:
+                try:
+                    error_data = response.json()
+                    error_message = error_data.get("error", response.text)
+                    error_code = error_data.get("code", response.status_code)
+                except Exception:
+                    error_message = response.text
+                    error_code = response.status_code
+                
+                if response.status_code == 401:
+                    raise ValueError("WAGate API key is invalid, missing, or revoked. Please reconnect.")
+                elif response.status_code == 403:
+                    raise ValueError("WAGate API access not included in your plan. Upgrade to Growth or Scale.")
+                elif response.status_code == 409:
+                    raise ValueError("No active WhatsApp connection on the WAGate workspace.")
+                elif response.status_code == 422:
+                    raise ValueError(f"Invalid request: {error_message}")
+                elif response.status_code == 502:
+                    raise ValueError("Upstream error from WhatsApp Cloud API. Please try again later.")
+                else:
+                    raise ValueError(f"WAGate API error ({error_code}): {error_message}")
+            
+            return response.json()
+
+    async def send_image_message(
+        self,
+        credentials: dict,
+        to_phone: str,
+        image_url: str,
+        caption: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Send an image message via WAGate.app API.
+        
+        Args:
+            credentials: Channel credentials with api_key (seller-specific)
+            to_phone: Recipient's phone number (digits only, international format)
+            image_url: Publicly accessible image URL (HTTPS)
+            caption: Optional caption for the image
+            
+        Returns:
+            API response dict with wamid and status on success
+        """
+        api_key = credentials.get("api_key") if credentials else None
+        if not api_key:
+            api_key = self.platform_api_key
+        if not api_key:
+            raise ValueError("WAGate API key not configured")
+        
+        if not image_url:
+            raise ValueError("Image URL is required")
+        
+        if not image_url.startswith("https://"):
+            raise ValueError("Image URL must be HTTPS for WhatsApp delivery")
+        
+        url = f"{self.base_url}/api/messages.php"
+        
+        payload = {
+            "to": to_phone,
+            "type": "image",
+            "image": {
+                "link": image_url
+            }
+        }
+        
+        if caption:
+            payload["image"]["caption"] = caption
+        
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, headers=headers, timeout=30)
+            
             if response.status_code != 200:
                 try:
                     error_data = response.json()

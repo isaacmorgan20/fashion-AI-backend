@@ -81,18 +81,31 @@ class ThreadOSAgent:
         elif ai_settings.get("productRecommendations") is False:
             products_text = "(Product recommendations disabled - do not suggest products)"
         else:
-            # Respect showAvailability setting - hide stock info if OFF
-            show_availability = ai_settings.get("showAvailability", True)
-            if show_availability:
-                products_text = "\n".join([
-                    f"- {p.name} ({p.category}): {currency} {p.price}, Stock: {p.stock}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}"
-                    for p in products
-                ]) if products else "(No products in catalog)"
+            # Build a CONCISE product summary for the AI - not the full catalog dump
+            # AI should answer naturally and only mention specific products when relevant
+            if products:
+                # Count by category for summary
+                from collections import Counter
+                cat_counts = Counter(p.category for p in products)
+                cat_summary = ", ".join(f"{count} {cat}" for cat, count in cat_counts.items())
+                
+                # Price range
+                prices = [p.price for p in products if p.price > 0]
+                price_range = f"{currency} {min(prices):.0f}–{currency} {max(prices):.0f}" if prices else "N/A"
+                
+                products_text = f"""CATALOG SUMMARY (reference only - do not list unless asked):
+- {len(products)} products across: {cat_summary}
+- Price range: {price_range}
+- Categories available: {', '.join(cat_counts.keys())}
+
+FULL PRODUCT DETAILS (use ONLY when customer asks about a specific product):
+"""
+                # Add full details but mark as reference
+                for p in products:
+                    stock_info = f", Stock: {p.stock}" if ai_settings.get("showAvailability", True) else ""
+                    products_text += f"- {p.name} ({p.category}): {currency} {p.price}{stock_info}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}\n"
             else:
-                products_text = "\n".join([
-                    f"- {p.name} ({p.category}): {currency} {p.price}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}"
-                    for p in products
-                ]) if products else "(No products in catalog)"
+                products_text = "(No products in catalog)"
 
         # Response style
         style = ai_settings.get("responseStyle", "Professional")
@@ -215,6 +228,11 @@ RESPONSE GUIDELINES:
 - If unsure about something, offer to connect to human
 - Keep responses concise but complete
 {stock_guideline}
+- DO NOT use markdown formatting (no **bold**, *italic*, `code`, # headers, - bullet lists)
+- DO NOT dump the full product catalog unless customer explicitly asks "show all products" or "list everything"
+- When customer asks about a category (e.g., "what dresses do you have?"), mention ONLY relevant products naturally
+- When recommending a specific product, include its name, price, and key details (colors/sizes) in plain text
+- Write as a natural fashion store conversation, not a structured list
 
 {handoff_section}
 

@@ -43,8 +43,43 @@ from app.login_security import (
 )
 import time
 import hashlib
+import re
 
 logger = logging.getLogger(__name__)
+
+
+def strip_markdown(text: str) -> str:
+    """
+    Strip markdown formatting from text for plain-text channels like WhatsApp.
+    
+    Removes: **bold**, *italic*, `code`, # headers, - bullet lists, > blockquotes
+    """
+    if not text:
+        return text
+    
+    # Remove **bold** and *italic* (but preserve single asterisks in words)
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # **bold**
+    text = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'\1', text)  # *italic*
+    
+    # Remove `code` backticks
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    
+    # Remove # headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    
+    # Remove - bullet lists at start of lines
+    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
+    
+    # Remove > blockquotes
+    text = re.sub(r'^\s*>\s+', '', text, flags=re.MULTILINE)
+    
+    # Remove numbered lists
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    
+    # Clean up multiple newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text.strip()
 
 
 router = APIRouter(prefix="/api/v1", tags=["conversations"])
@@ -3454,15 +3489,18 @@ async def _send_whatsapp_reply(
         logger.error(f"No WhatsApp credentials for seller: {seller_id}")
         return
     
+    # Strip markdown for plain-text WhatsApp delivery
+    clean_message = strip_markdown(message)
+    
     # Determine provider from metadata (default to "meta" for backward compatibility)
     metadata = channel.get("metadata") or {}
     provider = metadata.get("provider", "meta")
     
     try:
         if provider == "wagate":
-            await wagate_service.send_text_message(credentials, phone, message)
+            await wagate_service.send_text_message(credentials, phone, clean_message)
         else:
-            await whatsapp_service.send_text_message(credentials, phone, message)
+            await whatsapp_service.send_text_message(credentials, phone, clean_message)
     except ValueError as e:
         # Token expired or invalid
         logger.error(f"WhatsApp send failed (token issue): {e}")
