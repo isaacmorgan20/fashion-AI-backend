@@ -418,8 +418,23 @@ async def send_message(
                     logger.warning(f"Telegram conversation missing chat_id for seller={user_id}, conv={conversation_id}")
             else:
                 logger.warning(f"Telegram channel not configured for seller={user_id}")
-        # Note: WhatsApp/Instagram/Facebook/Website human-to-customer delivery can be added similarly
-    
+        elif channel_type == "whatsapp":
+            # Get WhatsApp channel for this seller
+            channel = get_user_channel(db, user_id, "whatsapp")
+            if channel and channel.get("credentials"):
+                phone = conv_data.get("phone")
+                if phone:
+                    try:
+                        await _send_whatsapp_reply(user_id, phone, message.content, channel)
+                        logger.info(f"Human message sent to WhatsApp phone={phone[:4]}**** for seller={user_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to send human message to WhatsApp for seller={user_id}: {e}")
+                else:
+                    logger.warning(f"WhatsApp conversation missing phone for seller={user_id}, conv={conversation_id}")
+            else:
+                logger.warning(f"WhatsApp channel not configured for seller={user_id}")
+        # Note: Instagram/Facebook/Website human-to-customer delivery can be added similarly
+        
     return new_message
 
 
