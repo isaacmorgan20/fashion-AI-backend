@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import asyncio
+import os
 from typing import List, Dict, Any, Optional, Callable, TypeVar
 from app.config import get_settings
 from app.models import ProductBase, MessageBase, SenderType, AIResponse, ChatRequest
@@ -10,8 +11,86 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
+
+def _extract_status_code(e: Exception) -> Optional[int]:
+    """
+    Extract HTTP status code from google.genai or google.generativeai exceptions.
+    
+    The google.genai SDK (v1) raises exceptions with .code or .status attributes.
+    The deprecated google.generativeai may include status in the error message.
+    """
+    # google.genai (new SDK) - exceptions often have .code or .status
+    for attr in ("code", "status", "status_code", "http_status"):
+        val = getattr(e, attr, None)
+        if isinstance(val, int):
+            return val
+    
+    # Check if exception has a response object with status
+    response = getattr(e, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status", "code"):
+            val = getattr(response, attr, None)
+            if isinstance(val, int):
+                return val
+    
+    # Fallback: check error message for HTTP status pattern
+    # This is a last resort - prefer SDK-provided status codes
+    error_str = str(e)
+    import re
+    match = re.search(r'\b(4\d{2}|5\d{2})\b', error_str)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            pass
+    
+    return None
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """
+    Determine if an exception represents a genuine rate limit (HTTP 429).
+    
+    Prefers SDK-provided status codes over string matching to avoid false positives.
+    """
+    status = _extract_status_code(e)
+    if status == 429:
+        return True
+    
+    # Fallback string matching ONLY for 429 when SDK doesn't expose status
+    # Do NOT match "quota", "exhausted", "limit" etc. without 429 status
+    error_str = str(e).lower()
+    return "429" in error_str
+
+
+def _is_auth_error(e: Exception) -> bool:
+    """Check if exception is an authentication/authorization error (401, 403)."""
+    status = _extract_status_code(e)
+    if status in (401, 403):
+        return True
+    error_str = str(e).lower()
+    return any(kw in error_str for kw in ("api key", "unauthorized", "forbidden", "invalid credential", "permission denied"))
+
+
+def _is_model_error(e: Exception) -> bool:
+    """Check if exception is a model-not-found/unavailable error (404, model-specific)."""
+    status = _extract_status_code(e)
+    if status == 404:
+        return True
+    error_str = str(e).lower()
+    return any(kw in error_str for kw in ("model not found", "model unavailable", "model does not exist", "not found"))
+
+
+def _is_network_timeout_error(e: Exception) -> bool:
+    """Check if exception is a network/timeout error."""
+    error_str = str(e).lower()
+    # Check for timeout, connection, network errors
+    network_keywords = ("timeout", "connection", "connect", "network", "dns", "unreachable", "timed out")
+    return any(kw in error_str for kw in network_keywords) and "429" not in error_str
+
+
 async def _retry_with_backoff(func: Callable[[], T], max_retries: int = 3, base_delay: float = 1.0) -> T:
-    """Retry a function with exponential backoff for rate limit errors."""
+    """Retry a function with exponential backoff for GENUINE rate limit errors only."""
     last_exception = None
     for attempt in range(max_retries):
         try:
@@ -21,21 +100,13 @@ async def _retry_with_backoff(func: Callable[[], T], max_retries: int = 3, base_
                 return func()
         except Exception as e:
             last_exception = e
-            # Check if it's a rate limit error (429)
-            error_str = str(e).lower()
-            is_rate_limit = (
-                "429" in error_str or 
-                "rate limit" in error_str or 
-                "quota exceeded" in error_str or
-                "resource_exhausted" in error_str or
-                "too many requests" in error_str
-            )
-            if is_rate_limit and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                logger.warning(f"[AI AGENT] Rate limit hit (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+            # Only retry on GENUINE rate limit (HTTP 429)
+            if _is_rate_limit_error(e) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff: 1.5s, 3s, 6s
+                logger.warning(f"[AI AGENT] Rate limit (429) hit (attempt {attempt + 1}/{max_retries}), retrying in {delay}s")
                 await asyncio.sleep(delay)
                 continue
-            # Not a rate limit error, or max retries reached
+            # Not a rate limit error, or max retries reached - don't retry
             raise
     raise last_exception
 
@@ -45,22 +116,35 @@ class ThreadOSAgent:
         self.settings = get_settings()
         self.client = None
         self.model = None
-        if self.settings.google_ai_api_key:
+        
+        # Validate API key presence (never log the key itself)
+        api_key = self.settings.google_ai_api_key
+        if not api_key or not api_key.strip():
+            logger.error("[AI AGENT] GOOGLE_AI_API_KEY is not configured. AI service will be unavailable.")
+        elif len(api_key.strip()) < 10:
+            logger.error("[AI AGENT] GOOGLE_AI_API_KEY appears invalid (too short). AI service will be unavailable.")
+            api_key = None
+        
+        if api_key:
             # Use new google.genai package with v1 API (not v1beta)
             try:
                 from google import genai
                 self.client = genai.Client(
-                    api_key=self.settings.google_ai_api_key,
+                    api_key=api_key,
                     http_options={"api_version": "v1"}
                 )
+                logger.info("[AI AGENT] Initialized google.genai client (v1 API)")
             except ImportError:
                 # Fallback to deprecated google.generativeai package
                 try:
                     import google.generativeai as genai
-                    genai.configure(api_key=self.settings.google_ai_api_key)
+                    genai.configure(api_key=api_key)
                     self.model = genai.GenerativeModel(self.settings.ai_model)
+                    logger.warning("[AI AGENT] Using deprecated google.generativeai package (fallback)")
                 except ImportError:
-                    pass
+                    logger.error("[AI AGENT] Neither google.genai nor google.generativeai available")
+            except Exception as e:
+                logger.error(f"[AI AGENT] Failed to initialize AI client: {type(e).__name__}")
         else:
             self.model = None
 
@@ -388,31 +472,24 @@ Return JSON with:
             return ai_resp
         except Exception as e:
             import traceback
-            logger.error(f"[AI AGENT] Generation failed: {e}")
-            logger.error(f"[AI AGENT] Traceback: {traceback.format_exc()}")
             
-            # Check if it's a rate limit error
-            error_str = str(e).lower()
-            is_rate_limit = (
-                "429" in error_str or 
-                "rate limit" in error_str or 
-                "quota exceeded" in error_str or
-                "resource_exhausted" in error_str or
-                "too many requests" in error_str
+            # Diagnostic logging - detailed error info for debugging
+            # NEVER logs API keys, tokens, or secrets
+            status_code = _extract_status_code(e)
+            logger.error(
+                f"[AI AGENT] Generation failed | "
+                f"type={type(e).__name__} | "
+                f"status={status_code} | "
+                f"message={str(e)}"
             )
+            logger.debug(f"[AI AGENT] Full traceback:\n{traceback.format_exc()}")
             
-            # Respect Human handoff OFF even on error
-            if ai_settings.get("humanHandoff") is False:
-                return AIResponse(
-                    response="I'm having trouble processing your request. Please try again later.",
-                    intent="error",
-                    confidence=0.0,
-                    requiresHandoff=False,
-                    handoffReason=None
-                )
+            # Classify error and respond appropriately
+            # Priority order: Rate limit > Auth > Model > Network > Unknown
             
-            if is_rate_limit:
-                # For rate limits, don't handoff - just ask to retry
+            if _is_rate_limit_error(e):
+                # GENUINE rate limit (HTTP 429)
+                logger.warning(f"[AI AGENT] Genuine rate limit detected (status={status_code})")
                 return AIResponse(
                     response="I'm temporarily unable to process your request due to high demand. Please try again in a moment.",
                     intent="error",
@@ -421,12 +498,47 @@ Return JSON with:
                     handoffReason="Rate limit exceeded"
                 )
             
+            if _is_auth_error(e):
+                # Authentication/API key error - don't tell customer "high demand"
+                logger.error(f"[AI AGENT] Authentication error (status={status_code}) - check GOOGLE_AI_API_KEY")
+                return AIResponse(
+                    response="I'm having trouble connecting to the AI service. Please try again later.",
+                    intent="error",
+                    confidence=0.0,
+                    requiresHandoff=False,
+                    handoffReason="Authentication error"
+                )
+            
+            if _is_model_error(e):
+                # Model not found/unavailable
+                logger.error(f"[AI AGENT] Model error (status={status_code}) - model may be unavailable")
+                return AIResponse(
+                    response="I'm having trouble with the AI model. Please try again later.",
+                    intent="error",
+                    confidence=0.0,
+                    requiresHandoff=False,
+                    handoffReason="Model error"
+                )
+            
+            if _is_network_timeout_error(e):
+                # Network/timeout error
+                logger.warning(f"[AI AGENT] Network/timeout error: {str(e)}")
+                return AIResponse(
+                    response="I'm having trouble connecting to the AI service. Please try again in a moment.",
+                    intent="error",
+                    confidence=0.0,
+                    requiresHandoff=False,
+                    handoffReason="Network error"
+                )
+            
+            # Unknown error - log full details, use generic fallback
+            logger.error(f"[AI AGENT] Unexpected error: {type(e).__name__}: {e}")
             return AIResponse(
                 response="I'm having trouble processing your request. Let me connect you with a human agent.",
                 intent="error",
                 confidence=0.0,
                 requiresHandoff=True,
-                handoffReason=f"AI error: {str(e)}"
+                handoffReason=f"AI error: {type(e).__name__}"
             )
 
     def detect_intent_simple(self, message: str) -> Dict[str, Any]:
