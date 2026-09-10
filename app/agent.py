@@ -80,6 +80,148 @@ def _is_network_timeout_error(e: Exception) -> bool:
     return any(kw in error_str for kw in network_keywords) and "429" not in error_str
 
 
+# ============================================================
+# SCOPE GATE - Strict ThreadOS Fashion domain classification
+# ============================================================
+
+# Keywords that indicate IN-SCOPE topics
+IN_SCOPE_KEYWORDS = {
+    # Greetings & conversation
+    "greeting": ("hi", "hello", "hey", "good morning", "good afternoon", "good evening", "howdy", "greetings"),
+    
+    # Products & catalog
+    "product": ("product", "dress", "shirt", "shoe", "shoes", "heel", "heels", "bag", "bags", "accessory", "accessories",
+                "cloth", "clothes", "clothing", "wear", "outfit", "fashion", "style", "item", "items",
+                "price", "cost", "how much", "ghs", "ghc", "cedi", "cedis",
+                "size", "sizes", "small", "medium", "large", "xl", "xxl", "xs", "m ", " l ", " s ",
+                "color", "colour", "black", "red", "blue", "white", "gold", "silver", "brown", "cream", "pink", "green",
+                "stock", "available", "availability", "in stock", "out of stock", "low stock",
+                "recommend", "suggest", "what do you have", "what's available", "catalog", "collection",
+                "dress", "dresses", "kaftan", "men", "women", "unisex"),
+    
+    # Orders & purchasing
+    "order": ("order", "buy", "purchase", "checkout", "cart", "payment", "pay", "card", "mobile money", "momo",
+              "deliver", "delivery", "shipping", "ship", "courier", "track", "tracking", "where is my",
+              "order status", "confirm", "confirmation", "receipt", "invoice"),
+    
+    # Policies & support
+    "policy": ("return", "refund", "exchange", "policy", "warranty", "guarantee",
+               "shipping", "cancel", "cancellation", "complaint", "issue", "problem", "wrong",
+               "damaged", "defective", "quality"),
+    
+    # Business info
+    "business": ("store", "shop", "business", "contact", "phone", "email", "location", "address",
+                 "hours", "open", "close", "about us", "who are you", "threados"),
+    
+    # Fashion/shopping assistance
+    "fashion_help": ("occasion", "wedding", "party", "event", "formal", "casual", "work", "office",
+                     "outfit", "match", "go with", "wear with", "style", "styling", "trend",
+                     "gift", "present", "birthday", "anniversary"),
+    
+    # Handoff
+    "handoff": ("human", "agent", "person", "operator", "representative", "speak to someone", "talk to someone"),
+}
+
+# Keywords that strongly indicate OUT-OF-SCOPE topics
+OUT_OF_SCOPE_KEYWORDS = {
+    # Politics & news
+    "politics": ("politic", "government", "election", "president", "minister", "parliament", "vote", "voting",
+                 "policy ", "legislat", "congress", "senate", "democrat", "republican", "party", "campaign"),
+    
+    # News & current events
+    "news": ("news", "headline", "breaking", "reporter", "journalist", "article", "press", "media"),
+    
+    # Sports
+    "sports": ("football", "soccer", "basketball", "tennis", "cricket", "olympics", "world cup", "championship",
+               "league", "match", "game", "score", "team", "player", "coach", "tournament"),
+    
+    # Education/academic
+    "education": ("homework", "assignment", "exam", "test", "quiz", "study", "university", "college", "school",
+                  "degree", "thesis", "research", "paper", "essay", "grade", "professor", "teacher", "lecture"),
+    
+    # Medical/health
+    "medical": ("diagnos", "symptom", "disease", "illness", "medicine", "drug", "prescription", "doctor", "hospital",
+                "treatment", "therapy", "health", "medical", "pain", "fever", "infection", "virus", "covid",
+                "headache", "migraine", "treat", "cure", "heal", "remedy", "pill", "tablet", "clinic", "nurse",
+                "pharmacy", "pharmacist", "allergy", "rash", "cough", "cold", "flu", "sick", "nausea", "vomit"),
+    
+    # Legal
+    "legal": ("law", "legal", "court", "judge", "lawyer", "attorney", "sue", "lawsuit", "contract", "statute",
+              "regulation", "compliance", "litigation", "rights", "patent", "copyright", "trademark"),
+    
+    # Financial advice (beyond simple payment)
+    "financial_advice": ("invest", "investment", "stock market", "bond", "crypto", "bitcoin", "trading", "portfolio",
+                         "interest rate", "mortgage", "loan", "credit score", "tax", "accounting", "audit"),
+    
+    # Technical/programming
+    "technical": ("code", "program", "python", "javascript", "java", "api", "database", "sql", "server",
+                  "deploy", "docker", "kubernetes", "aws", "azure", "git", "github", "bug", "debug", "compile"),
+    
+    # Other businesses/brands
+    "other_brands": ("zara", "hm ", "nike", "adidas", "gucci", "prada", "louis vuitton", "chanel", "versace",
+                     "amazon", "jumia", "aliexpress", "ebay", "shopify", "walmart", "target"),
+    
+    # Personal/private topics
+    "personal": ("relationship", "dating", "marriage", "divorce", "boyfriend", "girlfriend", "husband", "wife",
+                 "family", "parent", "child", "pregnan", "baby", "mental health", "therapy", "depression", "anxiety"),
+    
+    # Entertainment
+    "entertainment": ("movie", "film", "actor", "actress", "celebrity", "netflix", "youtube", "music", "song",
+                      "album", "concert", "festival", "tv show", "series", "game of thrones", "star wars"),
+}
+
+# Combined negative keywords for quick rejection
+ALL_OUT_OF_SCOPE_KEYWORDS = set()
+for cat_keywords in OUT_OF_SCOPE_KEYWORDS.values():
+    ALL_OUT_OF_SCOPE_KEYWORDS.update(cat_keywords)
+
+
+def classify_scope(message: str) -> tuple[bool, str]:
+    """
+    Classify if a message is IN_SCOPE for ThreadOS Fashion.
+    
+    Returns:
+        (is_in_scope, reason)
+        - is_in_scope: True if message is within ThreadOS Fashion scope
+        - reason: description of why (e.g., "greeting", "product_inquiry", "out_of_scope:politics")
+    """
+    msg_lower = message.lower().strip()
+    
+    # Empty or very short messages - treat as greeting-ish
+    if len(msg_lower) < 3:
+        return True, "short_message"
+    
+    # Check for explicit OUT-OF-SCOPE keywords first (stronger signal)
+    for category, keywords in OUT_OF_SCOPE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in msg_lower:
+                return False, f"out_of_scope:{category}"
+    
+    # Check for IN-SCOPE keywords
+    for category, keywords in IN_SCOPE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in msg_lower:
+                return True, category
+    
+    # Check for question patterns that are likely shopping-related
+    shopping_question_patterns = [
+        r"\bwhat\s+(do\s+you\s+)?(have|sell|offer)\b",
+        r"\bhow\s+(much|cost|price)\b",
+        r"\bwhere\s+(can\s+i|to\s+)\b",
+        r"\bcan\s+(i|you)\b.*\b(get|buy|find)\b",
+        r"\bis\s+(this|that|it)\b.*\b(available|in\s+stock)\b",
+        r"\bdo\s+you\s+(have|sell|carry)\b",
+    ]
+    import re
+    for pattern in shopping_question_patterns:
+        if re.search(pattern, msg_lower):
+            return True, "shopping_question"
+    
+    # Default: if unclear, be conservative and allow (let AI handle with low confidence → handoff)
+    # But for very obviously off-topic, we could reject. For now, allow with low confidence path.
+    return True, "unclear_allow"
+
+
 async def _retry_with_backoff(func: Callable[[], T], max_retries: int = 3, base_delay: float = 1.0) -> T:
     """Retry a function with exponential backoff for GENUINE rate limit errors only."""
     last_exception = None
@@ -378,6 +520,36 @@ Return JSON with:
                 conversation_context += f"{sender_label}: {msg.content}\n"
         else:
             conversation_context = "(Previous conversation history not available - customer memory disabled)\n"
+
+        # SCOPE GATE: Check if message is within ThreadOS Fashion domain
+        is_in_scope, scope_reason = classify_scope(request.message)
+        if not is_in_scope:
+            logger.info(f"[AI AGENT] OUT_OF_SCOPE detected: reason={scope_reason}, message={request.message[:100]}")
+            # Return polite redirect without calling Groq
+            redirect_responses = {
+                "out_of_scope:politics": "I'm here to help with ThreadOS Fashion products, orders, and store support. For political topics, I'd recommend a news source.",
+                "out_of_scope:news": "I specialize in fashion shopping assistance. For current events, please check a news website.",
+                "out_of_scope:sports": "I can help you find the perfect outfit for game day! For sports scores and updates, try a sports app.",
+                "out_of_scope:education": "I'm your fashion assistant, not a tutor. For homework help, try an educational resource.",
+                "out_of_scope:medical": "I can't provide medical advice. Please consult a healthcare professional for health concerns.",
+                "out_of_scope:legal": "I'm not qualified to give legal advice. Please speak with a lawyer for legal matters.",
+                "out_of_scope:financial_advice": "I can help with fashion purchases and payments. For financial advice, consult a financial advisor.",
+                "out_of_scope:technical": "I'm here for fashion shopping, not tech support. For programming help, try Stack Overflow or documentation.",
+                "out_of_scope:other_brands": "I only have information about ThreadOS Fashion products. I can't compare or discuss other brands.",
+                "out_of_scope:personal": "I'm here to help with your fashion shopping. For personal matters, I'd suggest speaking with appropriate professionals.",
+                "out_of_scope:entertainment": "I can help you find something stylish to wear! For entertainment news, check entertainment websites.",
+            }
+            redirect_msg = redirect_responses.get(scope_reason, 
+                "I'm here to help with ThreadOS Fashion products, orders, delivery, returns, and store information. How can I assist you with your shopping today?")
+            return AIResponse(
+                response=redirect_msg,
+                intent="out_of_scope",
+                confidence=0.0,
+                suggestedActions=["Browse products", "Track order", "Store policies", "Contact support"],
+                productsMentioned=[],
+                requiresHandoff=False,
+                handoffReason=None
+            )
 
         prompt = self._get_system_prompt(products, business_info, ai_settings, knowledge_settings)
         full_prompt = f"{prompt}\n\nCONVERSATION HISTORY:\n{conversation_context}\nCustomer: {request.message}\n\nRespond as JSON:"
