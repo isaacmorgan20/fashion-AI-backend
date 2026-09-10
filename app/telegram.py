@@ -86,6 +86,65 @@ class TelegramService:
 
             return response.json()
 
+    async def send_image_message(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: str = "",
+        parse_mode: Optional[str] = "HTML"
+    ) -> Dict[str, Any]:
+        """
+        Send an image message via Telegram Bot API.
+
+        Args:
+            chat_id: Recipient's chat ID
+            image_url: HTTPS URL of the image to send
+            caption: Optional caption for the image
+            parse_mode: Parse mode for caption formatting
+
+        Returns:
+            API response dict with message ID on success
+
+        Raises:
+            ValueError: If bot token not configured or Telegram returns an error
+        """
+        if not self.bot_token:
+            raise ValueError("Telegram bot token not configured")
+        if not image_url:
+            raise ValueError("Image URL is required")
+        if not image_url.startswith("https://"):
+            raise ValueError("Image URL must be HTTPS for Telegram delivery")
+
+        url = f"{self.base_url}/sendPhoto"
+
+        payload = {
+            "chat_id": chat_id,
+            "photo": image_url,
+        }
+
+        if caption:
+            payload["caption"] = caption
+            payload["parse_mode"] = parse_mode
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=30)
+
+            if response.status_code != 200:
+                error_data = response.json().get("error", {})
+                error_message = error_data.get("message", response.text)
+                error_code = error_data.get("code", response.status_code)
+
+                if error_code == 403:
+                    raise ValueError("Bot was blocked by the user or chat not found")
+                elif error_code == 400:
+                    raise ValueError(f"Invalid request: {error_message}")
+                elif error_code == 429:
+                    raise ValueError("Rate limit exceeded. Please try again later.")
+                else:
+                    raise ValueError(f"Telegram API error ({error_code}): {error_message}")
+
+            return response.json()
+
     async def set_webhook(
         self,
         url: str,

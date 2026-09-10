@@ -786,7 +786,7 @@ async def _process_normalized_event(
             })
             
             # Send AI response back via WAGate
-            await _send_whatsapp_reply(seller_id, phone, ai_response.response, channel)
+            await _send_whatsapp_reply(seller_id, phone, ai_response.response, channel, ai_response.productsMentioned, products)
             
         except Exception as e:
             logger.error(f"AI response generation failed for seller {seller_id}: {e}")

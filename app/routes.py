@@ -519,6 +519,19 @@ async def chat_with_ai(
             "conversationStatus": "handed_off",
             "updatedAt": time.time()
         })
+    else:
+        # Persist productsDiscussed to conversation if AI mentioned products
+        if ai_response.productsMentioned:
+            conv_ref = db.collection("users").document(user_id).collection("conversations").document(str(request.conversationId))
+            conv_doc = conv_ref.get()
+            if conv_doc.exists:
+                conv_data = conv_doc.to_dict()
+                existing_discussed = conv_data.get("productsDiscussed", [])
+                merged_discussed = list(set(existing_discussed + ai_response.productsMentioned))
+                conv_ref.update({
+                    "productsDiscussed": merged_discussed,
+                    "updatedAt": time.time()
+                })
     
     return ChatResponse(**ai_response.model_dump())
 
@@ -3311,7 +3324,7 @@ async def _process_normalized_telegram_event(
             # STAGE 10: Send AI response back via Telegram
             try:
                 log_stage("send_telegram_reply_start", chat_id=event.to_phone)
-                await _send_channel_reply(seller_id, event.to_phone, ai_response.response, channel)
+                await _send_channel_reply(seller_id, event.to_phone, ai_response.response, channel, ai_response.productsMentioned, products)
                 log_stage("send_telegram_reply_done")
             except Exception as e:
                 log_stage("send_telegram_reply", success=False, error=str(e))
@@ -3483,7 +3496,7 @@ async def _handle_incoming_whatsapp_message(
             })
             
             # Send AI response back via WhatsApp
-            await _send_whatsapp_reply(seller_id, phone, ai_response.response, channel)
+            await _send_whatsapp_reply(seller_id, phone, ai_response.response, channel, ai_response.productsMentioned, products)
             
         except Exception as e:
             logger.error(f"AI response generation failed: {e}")
@@ -3496,9 +3509,14 @@ async def _send_whatsapp_reply(
     seller_id: str,
     phone: str,
     message: str,
-    channel: dict
+    channel: dict,
+    products_mentioned: list = None,
+    products: list = None
 ):
-    """Send a reply message via WhatsApp using the appropriate provider service."""
+    """Send a reply message via WhatsApp using the appropriate provider service.
+    
+    If products_mentioned is provided, also sends product images with details.
+    """
     credentials = channel.get("credentials")
     if not credentials:
         logger.error(f"No WhatsApp credentials for seller: {seller_id}")
@@ -3516,6 +3534,26 @@ async def _send_whatsapp_reply(
             await wagate_service.send_text_message(credentials, phone, clean_message)
         else:
             await whatsapp_service.send_text_message(credentials, phone, clean_message)
+        
+        # If products were mentioned, send product images with details
+        if products_mentioned and products:
+            # Find product details from catalog
+            product_map = {p.name: p for p in products}
+            for product_name in products_mentioned:
+                product = product_map.get(product_name)
+                if product and product.image:
+                    try:
+                        caption = f"{product.name}\n{product.currency if hasattr(product, 'currency') else 'GHS'} {product.price}"
+                        if product.sizes:
+                            caption += f"\nSizes: {', '.join(product.sizes)}"
+                        if product.colors:
+                            caption += f"\nColors: {', '.join(product.colors)}"
+                        if provider == "wagate":
+                            await wagate_service.send_image_message(credentials, phone, product.image, caption)
+                        else:
+                            await whatsapp_service.send_image_message(credentials, phone, product.image, caption)
+                    except Exception as e:
+                        logger.error(f"Failed to send product image for {product_name}: {e}")
     except ValueError as e:
         # Token expired or invalid
         logger.error(f"WhatsApp send failed (token issue): {e}")
@@ -3537,12 +3575,15 @@ async def _send_channel_reply(
     seller_id: str,
     to_identifier: str,
     message: str,
-    channel: dict
+    channel: dict,
+    products_mentioned: list = None,
+    products: list = None
 ):
     """
     Send a reply message via the appropriate channel provider.
     
     Routes to the appropriate service based on channel metadata.provider.
+    If products_mentioned is provided, also sends product images with details.
     """
     credentials = channel.get("credentials")
     if not credentials:
@@ -3555,6 +3596,21 @@ async def _send_channel_reply(
     try:
         if provider == "telegram":
             await telegram_service.send_text_message(to_identifier, message)
+            # Send product images if mentioned
+            if products_mentioned and products:
+                product_map = {p.name: p for p in products}
+                for product_name in products_mentioned:
+                    product = product_map.get(product_name)
+                    if product and product.image:
+                        try:
+                            caption = f"{product.name}\nGHS {product.price}"
+                            if product.sizes:
+                                caption += f"\nSizes: {', '.join(product.sizes)}"
+                            if product.colors:
+                                caption += f"\nColors: {', '.join(product.colors)}"
+                            await telegram_service.send_image_message(to_identifier, product.image, caption)
+                        except Exception as e:
+                            logger.error(f"Failed to send Telegram product image for {product_name}: {e}")
         elif provider == "wagate":
             await wagate_service.send_text_message(credentials, to_identifier, message)
         else:

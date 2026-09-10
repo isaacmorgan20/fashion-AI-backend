@@ -14,18 +14,9 @@ T = TypeVar('T')
 
 def _extract_status_code(e: Exception) -> Optional[int]:
     """
-    Extract HTTP status code from google.genai or google.generativeai exceptions.
-    
-    The google.genai SDK (v1) raises exceptions with .code or .status attributes.
-    The deprecated google.generativeai may include status in the error message.
+    Extract HTTP status code from Groq or httpx exceptions.
     """
-    # google.genai (new SDK) - exceptions often have .code or .status
-    for attr in ("code", "status", "status_code", "http_status"):
-        val = getattr(e, attr, None)
-        if isinstance(val, int):
-            return val
-    
-    # Check if exception has a response object with status
+    # Check for httpx response
     response = getattr(e, "response", None)
     if response is not None:
         for attr in ("status_code", "status", "code"):
@@ -33,10 +24,14 @@ def _extract_status_code(e: Exception) -> Optional[int]:
             if isinstance(val, int):
                 return val
     
+    # Check for Groq SDK error attributes
+    for attr in ("code", "status_code", "status", "http_status"):
+        val = getattr(e, attr, None)
+        if isinstance(val, int):
+            return val
+    
     # Fallback: check error message for HTTP status pattern
-    # This is a last resort - prefer SDK-provided status codes
     error_str = str(e)
-    import re
     match = re.search(r'\b(4\d{2}|5\d{2})\b', error_str)
     if match:
         try:
@@ -50,15 +45,12 @@ def _extract_status_code(e: Exception) -> Optional[int]:
 def _is_rate_limit_error(e: Exception) -> bool:
     """
     Determine if an exception represents a genuine rate limit (HTTP 429).
-    
-    Prefers SDK-provided status codes over string matching to avoid false positives.
     """
     status = _extract_status_code(e)
     if status == 429:
         return True
     
     # Fallback string matching ONLY for 429 when SDK doesn't expose status
-    # Do NOT match "quota", "exhausted", "limit" etc. without 429 status
     error_str = str(e).lower()
     return "429" in error_str
 
@@ -84,7 +76,6 @@ def _is_model_error(e: Exception) -> bool:
 def _is_network_timeout_error(e: Exception) -> bool:
     """Check if exception is a network/timeout error."""
     error_str = str(e).lower()
-    # Check for timeout, connection, network errors
     network_keywords = ("timeout", "connection", "connect", "network", "dns", "unreachable", "timed out")
     return any(kw in error_str for kw in network_keywords) and "429" not in error_str
 
@@ -102,7 +93,7 @@ async def _retry_with_backoff(func: Callable[[], T], max_retries: int = 3, base_
             last_exception = e
             # Only retry on GENUINE rate limit (HTTP 429)
             if _is_rate_limit_error(e) and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)  # Exponential backoff: 1.5s, 3s, 6s
+                delay = base_delay * (2 ** attempt)
                 logger.warning(f"[AI AGENT] Rate limit (429) hit (attempt {attempt + 1}/{max_retries}), retrying in {delay}s")
                 await asyncio.sleep(delay)
                 continue
@@ -115,38 +106,27 @@ class ThreadOSAgent:
     def __init__(self):
         self.settings = get_settings()
         self.client = None
-        self.model = None
         
         # Validate API key presence (never log the key itself)
-        api_key = self.settings.google_ai_api_key
+        api_key = self.settings.groq_api_key
         if not api_key or not api_key.strip():
-            logger.error("[AI AGENT] GOOGLE_AI_API_KEY is not configured. AI service will be unavailable.")
+            logger.error("[AI AGENT] GROQ_API_KEY is not configured. AI service will be unavailable.")
         elif len(api_key.strip()) < 10:
-            logger.error("[AI AGENT] GOOGLE_AI_API_KEY appears invalid (too short). AI service will be unavailable.")
+            logger.error("[AI AGENT] GROQ_API_KEY appears invalid (too short). AI service will be unavailable.")
             api_key = None
         
         if api_key:
-            # Use new google.genai package with v1 API (not v1beta)
+            # Use Groq client (OpenAI-compatible API)
             try:
-                from google import genai
-                self.client = genai.Client(
-                    api_key=api_key,
-                    http_options={"api_version": "v1"}
-                )
-                logger.info("[AI AGENT] Initialized google.genai client (v1 API)")
+                from groq import Groq
+                self.client = Groq(api_key=api_key)
+                logger.info(f"[AI AGENT] Initialized Groq client with model={self.settings.groq_model}")
             except ImportError:
-                # Fallback to deprecated google.generativeai package
-                try:
-                    import google.generativeai as genai
-                    genai.configure(api_key=api_key)
-                    self.model = genai.GenerativeModel(self.settings.ai_model)
-                    logger.warning("[AI AGENT] Using deprecated google.generativeai package (fallback)")
-                except ImportError:
-                    logger.error("[AI AGENT] Neither google.genai nor google.generativeai available")
+                logger.error("[AI AGENT] Groq package not available. Please install 'groq>=1.7.0'")
             except Exception as e:
-                logger.error(f"[AI AGENT] Failed to initialize AI client: {type(e).__name__}")
+                logger.error(f"[AI AGENT] Failed to initialize Groq client: {type(e).__name__}: {e}")
         else:
-            self.model = None
+            self.client = None
 
     async def _generate_with_retry(self, func: Callable[[], T]) -> T:
         """Generate content with retry logic for rate limits."""
@@ -373,7 +353,7 @@ Return JSON with:
         """Generate AI response for customer message."""
         ai_settings = ai_settings or {}
         knowledge_settings = knowledge_settings or {}
-        if not self.client and not self.model:
+        if not self.client:
             # Respect Human handoff OFF even when AI not configured
             if ai_settings.get("humanHandoff") is False:
                 return AIResponse(
@@ -404,36 +384,29 @@ Return JSON with:
 
         try:
             if self.client:
-                # Use new google.genai client with retry for rate limits
-                logger.info(f"[AI AGENT] Calling new google.genai client with model={self.settings.ai_model}")
+                # Use Groq client (OpenAI-compatible API) with retry for rate limits
+                logger.info(f"[AI AGENT] Calling Groq client with model={self.settings.groq_model}")
                 response = await self._generate_with_retry(
-                    lambda: self.client.models.generate_content(
-                        model=self.settings.ai_model,
-                        contents=full_prompt,
-                        config={
-                            "temperature": self.settings.ai_temperature,
-                            "max_output_tokens": self.settings.ai_max_tokens,
-                        }
+                    lambda: self.client.chat.completions.create(
+                        model=self.settings.groq_model,
+                        messages=[{"role": "user", "content": full_prompt}],
+                        temperature=self.settings.ai_temperature,
+                        max_tokens=self.settings.ai_max_tokens,
                     )
                 )
-                response_text = response.text
-                logger.info(f"[AI AGENT] New client response received, len={len(response_text)}")
+                response_text = response.choices[0].message.content
+                logger.info(f"[AI AGENT] Groq response received, len={len(response_text)}")
                 logger.debug(f"[AI AGENT] Response text preview: {response_text[:200]}")
             else:
-                # Fallback to deprecated package with retry
-                logger.info(f"[AI AGENT] Calling deprecated google.generativeai with model={self.settings.ai_model}")
-                response = await self._generate_with_retry(
-                    lambda: self.model.generate_content(
-                        full_prompt,
-                        generation_config={
-                            "temperature": self.settings.ai_temperature,
-                            "max_output_tokens": self.settings.ai_max_tokens,
-                        }
-                    )
+                # AI client not initialized
+                logger.error("[AI AGENT] Groq client not initialized")
+                return AIResponse(
+                    response="I'm currently unavailable. Please try again later or contact our support team.",
+                    intent="error",
+                    confidence=0.0,
+                    requiresHandoff=True,
+                    handoffReason="AI service not configured"
                 )
-                response_text = response.text
-                logger.info(f"[AI AGENT] Deprecated package response received, len={len(response_text)}")
-                logger.debug(f"[AI AGENT] Response text preview: {response_text[:200]}")
             logger.info(f"[AI AGENT] Parsing response...")
             ai_resp = self._parse_ai_response(response_text)
             logger.info(f"[AI AGENT] Parsed response: intent={ai_resp.intent}, confidence={ai_resp.confidence}, requires_handoff={ai_resp.requiresHandoff}, response_len={len(ai_resp.response)}")
@@ -500,7 +473,7 @@ Return JSON with:
             
             if _is_auth_error(e):
                 # Authentication/API key error - don't tell customer "high demand"
-                logger.error(f"[AI AGENT] Authentication error (status={status_code}) - check GOOGLE_AI_API_KEY")
+                logger.error(f"[AI AGENT] Authentication error (status={status_code}) - check GROQ_API_KEY")
                 return AIResponse(
                     response="I'm having trouble connecting to the AI service. Please try again later.",
                     intent="error",

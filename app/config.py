@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     firebase_auth_uri: str = "https://accounts.google.com/o/oauth2/auth"
     firebase_token_uri: str = "https://oauth2.googleapis.com/token"
 
-    # Google AI (Gemini)
-    google_ai_api_key: Optional[str] = None
+    # Groq AI (ONLY AI provider)
+    groq_api_key: Optional[str] = None
+    groq_model: str = "openai/gpt-oss-20b"
 
     # App
     app_env: str = "development"
@@ -23,8 +24,7 @@ class Settings(BaseSettings):
     app_port: int = 8000
     frontend_url: str = "http://localhost:5173"
 
-    # AI Agent
-    ai_model: str = "gemini-1.5-flash-latest"
+    # AI Agent (uses groq_model)
     ai_temperature: float = 0.3
     ai_max_tokens: int = 2048
 
