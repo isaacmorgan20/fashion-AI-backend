@@ -309,7 +309,7 @@ FULL PRODUCT DETAILS (use ONLY when customer asks about a specific product):
                 # Add full details but mark as reference
                 for p in products:
                     stock_info = f", Stock: {p.stock}" if ai_settings.get("showAvailability", True) else ""
-                    products_text += f"- {p.name} ({p.category}): {currency} {p.price}{stock_info}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}\n"
+                    products_text += f"- {p.name} ({p.category}): {currency} {p.price}{stock_info}, Sizes: {', '.join(p.sizes) if p.sizes else 'N/A'}, Colors: {', '.join(p.colors) if p.colors else 'N/A'}, Image: {p.image or 'N/A'}\n"
             else:
                 products_text = "(No products in catalog)"
 

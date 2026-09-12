@@ -98,6 +98,9 @@ class CustomerBase(BaseModel):
     ordersList: List[dict] = []
     conversationsList: List[dict] = []
     online: bool = False
+    telegram_username: Optional[str] = None
+    telegram_first_name: Optional[str] = None
+    telegram_last_name: Optional[str] = None
 
 
 class CustomerCreate(BaseModel):
@@ -220,6 +223,9 @@ class ConversationBase(BaseModel):
     orders: List[dict] = []
     productsDiscussed: List[str] = []
     messages: List[MessageBase] = []
+    telegram_username: Optional[str] = None
+    telegram_first_name: Optional[str] = None
+    telegram_last_name: Optional[str] = None
 
     @field_validator("channel", mode="before")
     @classmethod

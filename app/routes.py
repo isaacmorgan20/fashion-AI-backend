@@ -3752,6 +3752,11 @@ def _find_or_create_conversation(
         # Match by chat_id for Telegram, phone for WhatsApp
         if chat_id and data.get("chat_id") == chat_id:
             data["id"] = doc.id
+            # Populate Telegram identity fields from customer if available (for existing conversations)
+            if (channel == "telegram" or channel == "Telegram") or data.get("channel") == "telegram" or data.get("channel") == "Telegram":
+                data["telegram_username"] = customer.get("telegram_username")
+                data["telegram_first_name"] = customer.get("telegram_first_name")
+                data["telegram_last_name"] = customer.get("telegram_last_name")
             return data
         if not chat_id and data.get("phone") == phone:
             data["id"] = doc.id
@@ -3779,6 +3784,11 @@ def _find_or_create_conversation(
         "createdAt": now,
         "updatedAt": now,
     }
+    # Populate Telegram identity fields from customer if available
+    if channel == "telegram" or channel == "Telegram":
+        conv_data["telegram_username"] = customer.get("telegram_username")
+        conv_data["telegram_first_name"] = customer.get("telegram_first_name")
+        conv_data["telegram_last_name"] = customer.get("telegram_last_name")
     
     doc_ref = convs_ref.document()
     doc_ref.set(conv_data)
