@@ -11,6 +11,7 @@ from app.models import (
     OrderBase, OrderCreate, OrderUpdate,
     SettingsBase, SettingsUpdate, AnalyticsResponse,
     NotificationEvent, NotificationEventCreate, NotificationEventType,
+    SearchResult, SearchResultType, SearchResponse,
     ChannelType, ChannelConnectionStatus, ChannelConnection, ChannelConnectionCreate, ChannelConnectionUpdate,
     StorefrontSettings, PublicStorefront,
     TeamMember, TeamMemberCreate, TeamMemberUpdate, TeamMemberRole, TeamMemberStatus, TeamMemberPermissions,
@@ -44,8 +45,126 @@ from app.login_security import (
 import time
 import hashlib
 import re
+from contextvars import ContextVar
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# In-request settings cache - stores settings per request context
+# Key: user_id, Value: (settings_dict, timestamp)
+_settings_cache: dict = {}
+_SETTINGS_CACHE_TTL = 30  # seconds
+
+# Request-scoped settings cache using contextvar
+_current_request_settings: ContextVar[Optional[dict]] = ContextVar('_current_request_settings', default=None)
+
+def get_cached_settings(db, user_id: str, force_refresh: bool = False) -> dict:
+    """
+    Get settings with in-request caching to avoid multiple Firestore reads per request.
+    
+    Args:
+        db: Firestore client
+        user_id: The seller's user ID
+        force_refresh: Force a fresh read from Firestore
+        
+    Returns:
+        Settings dict with all sections merged with defaults
+    """
+    # Check request-scoped cache first
+    request_settings = _current_request_settings.get()
+    if request_settings is not None and not force_refresh:
+        return request_settings
+    
+    # Check module-level cache with TTL
+    now = time.time()
+    if not force_refresh and user_id in _settings_cache:
+        cached_settings, cached_time = _settings_cache[user_id]
+        if now - cached_time < _SETTINGS_CACHE_TTL:
+            _current_request_settings.set(cached_settings)
+            return cached_settings
+    
+    # Read from Firestore
+    doc_ref = db.collection("users").document(user_id).collection("settings").document("config")
+    doc = doc_ref.get()
+    
+    if doc.exists:
+        data = doc.to_dict()
+    else:
+        data = {}
+    
+    # Merge with defaults
+    merged = {**DEFAULT_SETTINGS, **data}
+    for k in DEFAULT_SETTINGS:
+        if isinstance(DEFAULT_SETTINGS[k], dict) and isinstance(merged.get(k), dict):
+            merged[k] = {**DEFAULT_SETTINGS[k], **merged[k]}
+    
+    # Update caches
+    _settings_cache[user_id] = (merged, now)
+    _current_request_settings.set(merged)
+    
+    logger.debug(f"[FIRESTORE] Settings read for user={user_id} (cache miss)")
+    return merged
+
+def clear_settings_cache(user_id: Optional[str] = None) -> None:
+    """Clear settings cache for a user or all users."""
+    global _settings_cache
+    if user_id:
+        _settings_cache.pop(user_id, None)
+    else:
+        _settings_cache.clear()
+    _current_request_settings.set(None)
+
+
+# ============================================================
+# PUBLIC STOREFRONT CACHE
+# ============================================================
+
+# In-memory cache for public storefront data (no auth required, high traffic)
+# Key: seller_id, Value: (data_dict, timestamp)
+_storefront_settings_cache: dict = {}
+_STOREFRONT_SETTINGS_CACHE_TTL = 60  # seconds
+
+_storefront_products_cache: dict = {}
+_STOREFRONT_PRODUCTS_CACHE_TTL = 60  # seconds
+
+def get_cached_storefront_settings(db, seller_id: str) -> dict:
+    """Get storefront settings with in-memory caching for public endpoints."""
+    now = time.time()
+    if seller_id in _storefront_settings_cache:
+        cached_data, cached_time = _storefront_settings_cache[seller_id]
+        if now - cached_time < _STOREFRONT_SETTINGS_CACHE_TTL:
+            logger.debug(f"[FIRESTORE] Storefront settings cache HIT for seller={seller_id}")
+            return cached_data
+    
+    # Read from Firestore using existing helper
+    settings = get_user_storefront_settings(db, seller_id)
+    _storefront_settings_cache[seller_id] = (settings, now)
+    logger.debug(f"[FIRESTORE] Storefront settings cache MISS for seller={seller_id}")
+    return settings
+
+def get_cached_storefront_products(db, seller_id: str) -> list:
+    """Get storefront products with in-memory caching for public endpoints."""
+    now = time.time()
+    if seller_id in _storefront_products_cache:
+        cached_data, cached_time = _storefront_products_cache[seller_id]
+        if now - cached_time < _STOREFRONT_PRODUCTS_CACHE_TTL:
+            logger.debug(f"[FIRESTORE] Storefront products cache HIT for seller={seller_id}")
+            return cached_data
+    
+    products = get_user_products(db, seller_id)
+    _storefront_products_cache[seller_id] = (products, now)
+    logger.debug(f"[FIRESTORE] Storefront products cache MISS for seller={seller_id}")
+    return products
+
+def clear_storefront_cache(seller_id: Optional[str] = None) -> None:
+    """Clear storefront cache for a seller or all sellers."""
+    global _storefront_settings_cache, _storefront_products_cache
+    if seller_id:
+        _storefront_settings_cache.pop(seller_id, None)
+        _storefront_products_cache.pop(seller_id, None)
+    else:
+        _storefront_settings_cache.clear()
+        _storefront_products_cache.clear()
 
 
 def strip_markdown(text: str) -> str:
@@ -112,13 +231,9 @@ async def get_current_user(
         user_id = user_data.get("uid")
         db = get_firestore_client()
         
-        # Get session timeout preference
-        try:
-            settings_doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-            settings = settings_doc.to_dict() if settings_doc.exists else {}
-            timeout_minutes = get_session_timeout_from_settings(settings)
-        except Exception:
-            timeout_minutes = 30
+        # Get timeout from cached user settings (uses in-request + module-level cache, no extra Firestore read)
+        settings = get_cached_settings(db, user_id)
+        timeout_minutes = get_session_timeout_from_settings(settings)
         
         session = validate_session(user_id, x_session_id, x_session_token)
         if session is None:
@@ -155,16 +270,11 @@ def get_user_products(db, user_id: str) -> List[ProductBase]:
 
 
 def get_user_ai_settings(db, user_id: str) -> dict:
-    """Get AI settings for seller, seller-isolated, with defaults. Single source of truth is users/{uid}/settings."""
-    try:
-        doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        if doc.exists:
-            data = doc.to_dict()
-            ai = data.get("ai")
-            if isinstance(ai, dict) and ai:
-                return ai
-    except Exception:
-        pass
+    """Get AI settings for seller, seller-isolated, with defaults. Uses in-request cache."""
+    settings = get_cached_settings(db, user_id)
+    ai = settings.get("ai")
+    if isinstance(ai, dict) and ai:
+        return ai
     return {
         "enabled": True,
         "autoReply": True,
@@ -178,16 +288,11 @@ def get_user_ai_settings(db, user_id: str) -> dict:
 
 
 def get_user_customer_settings(db, user_id: str) -> dict:
-    """Get customer experience settings for seller, seller-isolated, with defaults."""
-    try:
-        doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        if doc.exists:
-            data = doc.to_dict()
-            customer = data.get("customer")
-            if isinstance(customer, dict) and customer:
-                return customer
-    except Exception:
-        pass
+    """Get customer experience settings for seller, seller-isolated, with defaults. Uses in-request cache."""
+    settings = get_cached_settings(db, user_id)
+    customer = settings.get("customer")
+    if isinstance(customer, dict) and customer:
+        return customer
     return {
         "welcomeMessage": "Hi! Welcome to our store. How can we help you today?",
         "orderConfirmation": "Your order has been received and is being processed.",
@@ -201,16 +306,11 @@ def get_user_customer_settings(db, user_id: str) -> dict:
 
 
 def get_user_knowledge_settings(db, user_id: str) -> dict:
-    """Get knowledge settings for seller, seller-isolated, with defaults."""
-    try:
-        doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        if doc.exists:
-            data = doc.to_dict()
-            knowledge = data.get("knowledge")
-            if isinstance(knowledge, dict) and knowledge:
-                return {**DEFAULT_SETTINGS["knowledge"], **knowledge}
-    except Exception:
-        pass
+    """Get knowledge settings for seller, seller-isolated, with defaults. Uses in-request cache."""
+    settings = get_cached_settings(db, user_id)
+    knowledge = settings.get("knowledge")
+    if isinstance(knowledge, dict) and knowledge:
+        return {**DEFAULT_SETTINGS["knowledge"], **knowledge}
     return DEFAULT_SETTINGS["knowledge"].copy()
 
 
@@ -1244,6 +1344,9 @@ async def update_settings(update: SettingsUpdate, current_user: dict = Depends(g
             base[key] = val
     base["updatedAt"] = time.time()
     doc_ref.set(base, merge=True)
+    # Clear caches for this user
+    clear_settings_cache(user_id)
+    clear_storefront_cache(user_id)
     # also sync general businessName/email/phone to user doc
     if "general" in update_data:
         g = base.get("general", {})
@@ -1271,16 +1374,11 @@ async def update_settings(update: SettingsUpdate, current_user: dict = Depends(g
 # ============================================================
 
 def get_user_storefront_settings(db, user_id: str) -> dict:
-    """Get storefront settings for seller, seller-isolated, with defaults."""
-    try:
-        doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        if doc.exists:
-            data = doc.to_dict()
-            storefront = data.get("storefront")
-            if isinstance(storefront, dict) and storefront:
-                return {**DEFAULT_SETTINGS["storefront"], **storefront}
-    except Exception:
-        pass
+    """Get storefront settings for seller, seller-isolated, with defaults. Uses in-request cache."""
+    settings = get_cached_settings(db, user_id)
+    storefront = settings.get("storefront")
+    if isinstance(storefront, dict) and storefront:
+        return {**DEFAULT_SETTINGS["storefront"], **storefront}
     return DEFAULT_SETTINGS["storefront"].copy()
 
 
@@ -1289,9 +1387,10 @@ async def get_public_storefront(seller_id: str):
     """
     Get public storefront settings for a seller.
     This endpoint does NOT require authentication - it's for public access.
+    Uses in-memory cache to reduce Firestore reads.
     """
     db = get_firestore_client()
-    settings = get_user_storefront_settings(db, seller_id)
+    settings = get_cached_storefront_settings(db, seller_id)
     
     if not settings.get("enabled"):
         raise HTTPException(status_code=404, detail="Storefront is not available")
@@ -1315,14 +1414,15 @@ async def get_public_storefront_products(seller_id: str):
     Get public product listing for a seller's storefront.
     This endpoint does NOT require authentication - it's for public access.
     Respects storefront settings: showPrices, showStock.
+    Uses in-memory cache to reduce Firestore reads.
     """
     db = get_firestore_client()
-    settings = get_user_storefront_settings(db, seller_id)
+    settings = get_cached_storefront_settings(db, seller_id)
     
     if not settings.get("enabled"):
         raise HTTPException(status_code=404, detail="Storefront is not available")
     
-    products = get_user_products(db, seller_id)
+    products = get_cached_storefront_products(db, seller_id)
     
     # Filter out products with 0 stock if showStock is disabled
     if not settings.get("showStock", True):
@@ -1359,9 +1459,10 @@ async def public_storefront_chat(seller_id: str, request: ChatRequest):
     """
     Public chat endpoint for storefront.
     Respects storefront settings: showAiAssistant, allowGuestBrowsing.
+    Uses in-memory cache to reduce Firestore reads.
     """
     db = get_firestore_client()
-    settings = get_user_storefront_settings(db, seller_id)
+    settings = get_cached_storefront_settings(db, seller_id)
     
     if not settings.get("enabled"):
         raise HTTPException(status_code=404, detail="Storefront is not available")
@@ -1380,7 +1481,7 @@ async def public_storefront_chat(seller_id: str, request: ChatRequest):
             handoffReason="AI assistant is disabled"
         )
     
-    # Get seller data for AI
+    # Get seller data for AI (uses in-request cache)
     business_info = get_user_business_info(db, seller_id)
     products = get_user_products(db, seller_id)
     ai_settings = get_user_ai_settings(db, seller_id)
@@ -1406,39 +1507,37 @@ async def public_storefront_chat(seller_id: str, request: ChatRequest):
 # ============================================================
 
 def get_user_team(db, user_id: str) -> List[dict]:
-    """Get team members for seller, seller-isolated, with owner always included."""
+    """Get team members for seller, seller-isolated, with owner always included. Uses in-request cache."""
     try:
-        doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        if doc.exists:
-            data = doc.to_dict()
-            team = data.get("team")
-            if isinstance(team, list):
-                # Ensure owner is always in the team list
-                owner_exists = any(m.get("role") == "Owner" for m in team)
-                if not owner_exists:
-                    # Get owner info from user doc
-                    user_doc = db.collection("users").document(user_id).get()
-                    user_data = user_doc.to_dict() if user_doc.exists else {}
-                    owner_member = {
-                        "id": user_id,
-                        "uid": user_id,
-                        "name": user_data.get("name", user_data.get("businessName", "Owner")),
-                        "email": user_data.get("email", ""),
-                        "role": "Owner",
-                        "status": "Active",
-                        "permissions": {
-                            "canManageProducts": True,
-                            "canManageOrders": True,
-                            "canManageCustomers": True,
-                            "canManageConversations": True,
-                            "canManageSettings": True,
-                            "canManageTeam": True,
-                            "canViewAnalytics": True,
-                        },
-                        "joinedAt": user_data.get("createdAt", time.time()),
-                    }
-                    team.insert(0, owner_member)
-                return team
+        settings = get_cached_settings(db, user_id)
+        team = settings.get("team")
+        if isinstance(team, list):
+            # Ensure owner is always in the team list
+            owner_exists = any(m.get("role") == "Owner" for m in team)
+            if not owner_exists:
+                # Get owner info from user doc
+                user_doc = db.collection("users").document(user_id).get()
+                user_data = user_doc.to_dict() if user_doc.exists else {}
+                owner_member = {
+                    "id": user_id,
+                    "uid": user_id,
+                    "name": user_data.get("name", user_data.get("businessName", "Owner")),
+                    "email": user_data.get("email", ""),
+                    "role": "Owner",
+                    "status": "Active",
+                    "permissions": {
+                        "canManageProducts": True,
+                        "canManageOrders": True,
+                        "canManageCustomers": True,
+                        "canManageConversations": True,
+                        "canManageSettings": True,
+                        "canManageTeam": True,
+                        "canViewAnalytics": True,
+                    },
+                    "joinedAt": user_data.get("createdAt", time.time()),
+                }
+                team.insert(0, owner_member)
+            return team
     except Exception:
         pass
     return []
@@ -1675,13 +1774,9 @@ async def create_user_session(
     db = get_firestore_client()
     user_id = current_user["uid"]
     
-    # Get session timeout preference
-    try:
-        settings_doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        settings = settings_doc.to_dict() if settings_doc.exists else {}
-        timeout_minutes = get_session_timeout_from_settings(settings)
-    except Exception:
-        timeout_minutes = 30
+    # Get session timeout preference from cached settings
+    settings = get_cached_settings(db, user_id)
+    timeout_minutes = get_session_timeout_from_settings(settings)
     
     # Generate token and create session
     token = generate_session_token()
@@ -1959,20 +2054,131 @@ async def regenerate_two_factor_backup_codes(
 
 
 # ============================================================
+# SEARCH
+# ============================================================
+
+def _search_text_in_data(text: str, data: dict, fields: list) -> bool:
+    """Case-insensitive text search in specified fields of a dict."""
+    text_lower = text.lower()
+    for field in fields:
+        value = data.get(field)
+        if value and text_lower in str(value).lower():
+            return True
+    return False
+
+
+@router.get("/search", response_model=SearchResponse)
+async def search_global(
+    current_user: dict = Depends(get_current_user),
+    q: str = Query(..., min_length=1, max_length=100),
+    limit: int = Query(10, le=50),
+):
+    """
+    Global search across conversations, customers, products, and orders.
+    Returns top matches from each category.
+    """
+    db = get_firestore_client()
+    user_id = current_user["uid"]
+    query_text = q.strip().lower()
+
+    all_results = []
+
+    # Search conversations
+    try:
+        conv_ref = db.collection("users").document(user_id).collection("conversations")
+        conv_docs = conv_ref.order_by("updatedAt", direction="DESCENDING").limit(200).stream()
+        for doc in conv_docs:
+            data = doc.to_dict()
+            data["id"] = doc.id
+            if _search_text_in_data(query_text, data, ["name", "lastMessage", "phone", "email", "location"]):
+                all_results.append(SearchResult(
+                    type=SearchResultType.CONVERSATION,
+                    id=data["id"],
+                    title=data.get("name", "Unnamed conversation"),
+                    subtitle=f"{data.get('channel', 'Website')} · {data.get('lastMessage', '')[:60]}",
+                    url=f"/#conversation/{data['id']}",
+                ))
+                if len(all_results) >= limit:
+                    break
+    except Exception as e:
+        logger.warning(f"Search conversations failed: {e}")
+
+    # Search customers
+    if len(all_results) < limit:
+        try:
+            cust_ref = db.collection("users").document(user_id).collection("customers")
+            cust_docs = cust_ref.order_by("updatedAt", direction="DESCENDING").limit(200).stream()
+            for doc in cust_docs:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                if _search_text_in_data(query_text, data, ["name", "phone", "email", "location"]):
+                    all_results.append(SearchResult(
+                        type=SearchResultType.CUSTOMER,
+                        id=data["id"],
+                        title=data.get("name", "Unnamed customer"),
+                        subtitle=f"{data.get('phone', '')} · {data.get('email', '')}".strip(" ·"),
+                        url=f"/customers/{data['id']}",
+                    ))
+                    if len(all_results) >= limit:
+                        break
+        except Exception as e:
+            logger.warning(f"Search customers failed: {e}")
+
+    # Search products
+    if len(all_results) < limit:
+        try:
+            prod_ref = db.collection("users").document(user_id).collection("products")
+            prod_docs = prod_ref.limit(200).stream()
+            for doc in prod_docs:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                if _search_text_in_data(query_text, data, ["name", "category", "description"]):
+                    all_results.append(SearchResult(
+                        type=SearchResultType.PRODUCT,
+                        id=data["id"],
+                        title=data.get("name", "Unnamed product"),
+                        subtitle=f"{data.get('category', '')} · GHS {data.get('price', 0)}",
+                        url=f"/products/{data['id']}",
+                    ))
+                    if len(all_results) >= limit:
+                        break
+        except Exception as e:
+            logger.warning(f"Search products failed: {e}")
+
+    # Search orders
+    if len(all_results) < limit:
+        try:
+            order_ref = db.collection("users").document(user_id).collection("orders")
+            order_docs = order_ref.order_by("createdAt", direction="DESCENDING").limit(200).stream()
+            for doc in order_docs:
+                data = doc.to_dict()
+                data["id"] = data.get("id") or doc.id
+                if _search_text_in_data(query_text, data, ["productName", "product", "customerName", "id", "amount"]):
+                    all_results.append(SearchResult(
+                        type=SearchResultType.ORDER,
+                        id=data["id"],
+                        title=f"Order {data.get('id', data['id'])}",
+                        subtitle=f"{data.get('productName', data.get('product', 'Unknown'))} · {data.get('amount', '')}",
+                        url=f"/orders/{data['id']}",
+                    ))
+                    if len(all_results) >= limit:
+                        break
+        except Exception as e:
+            logger.warning(f"Search orders failed: {e}")
+
+    return SearchResponse(results=all_results[:limit], query=q)
+
+
+# ============================================================
 # NOTIFICATIONS
 # ============================================================
 
 def get_user_notification_settings(db, user_id: str) -> dict:
-    """Get notification settings for seller, seller-isolated, with defaults."""
-    try:
-        doc = db.collection("users").document(user_id).collection("settings").document("config").get()
-        if doc.exists:
-            data = doc.to_dict()
-            notifications = data.get("notifications")
-            if isinstance(notifications, dict) and notifications:
-                return notifications
-    except Exception:
-        pass
+    """Get notification settings for seller, seller-isolated, with defaults. Uses in-request cache."""
+    settings = get_cached_settings(db, user_id)
+    notifications = settings.get("notifications")
+    if isinstance(notifications, dict) and notifications:
+        return notifications
     return {
         "newConversation": True,
         "humanHandoff": True,
@@ -3542,18 +3748,57 @@ async def _send_whatsapp_reply(
             for product_name in products_mentioned:
                 product = product_map.get(product_name)
                 if product and product.image:
-                    try:
-                        caption = f"{product.name}\n{product.currency if hasattr(product, 'currency') else 'GHS'} {product.price}"
+                    image_url = product.image
+                    # Validate image URL
+                    if not image_url.startswith("https://"):
+                        logger.error(f"WhatsApp image send skipped for {product_name}: invalid URL scheme (must be HTTPS). URL: {image_url[:100]}")
+                        # Send text fallback with product details
+                        fallback_msg = f"[Image unavailable] {product.name} — GHS {product.price}"
                         if product.sizes:
-                            caption += f"\nSizes: {', '.join(product.sizes)}"
+                            fallback_msg += f"\nSizes: {', '.join(product.sizes)}"
                         if product.colors:
-                            caption += f"\nColors: {', '.join(product.colors)}"
+                            fallback_msg += f"\nColors: {', '.join(product.colors)}"
                         if provider == "wagate":
-                            await wagate_service.send_image_message(credentials, phone, product.image, caption)
+                            await wagate_service.send_text_message(credentials, phone, fallback_msg)
                         else:
-                            await whatsapp_service.send_image_message(credentials, phone, product.image, caption)
+                            await whatsapp_service.send_text_message(credentials, phone, fallback_msg)
+                        continue
+                    
+                    caption = f"{product.name}\n{product.currency if hasattr(product, 'currency') else 'GHS'} {product.price}"
+                    if product.sizes:
+                        caption += f"\nSizes: {', '.join(product.sizes)}"
+                    if product.colors:
+                        caption += f"\nColors: {', '.join(product.colors)}"
+                    
+                    logger.info(f"WhatsApp sending product image: provider={provider}, product={product_name}, image_url={image_url[:100]}")
+                    try:
+                        if provider == "wagate":
+                            result = await wagate_service.send_image_message(credentials, phone, image_url, caption)
+                        else:
+                            result = await whatsapp_service.send_image_message(credentials, phone, image_url, caption)
+                        logger.info(f"WhatsApp product image sent successfully: provider={provider}, product={product_name}, response={result}")
                     except Exception as e:
-                        logger.error(f"Failed to send product image for {product_name}: {e}")
+                        # Log complete exception details
+                        import traceback
+                        logger.error(
+                            f"WhatsApp image send FAILED: "
+                            f"provider={provider}, "
+                            f"product={product_name}, "
+                            f"image_url={image_url[:100]}, "
+                            f"error_type={type(e).__name__}, "
+                            f"error_message={str(e)}, "
+                            f"traceback={traceback.format_exc()}"
+                        )
+                        # Send text fallback with product details so customer isn't left hanging
+                        fallback_msg = f"[Image unavailable] {product.name} — GHS {product.price}"
+                        if product.sizes:
+                            fallback_msg += f"\nSizes: {', '.join(product.sizes)}"
+                        if product.colors:
+                            fallback_msg += f"\nColors: {', '.join(product.colors)}"
+                        if provider == "wagate":
+                            await wagate_service.send_text_message(credentials, phone, fallback_msg)
+                        else:
+                            await whatsapp_service.send_text_message(credentials, phone, fallback_msg)
     except ValueError as e:
         # Token expired or invalid
         logger.error(f"WhatsApp send failed (token issue): {e}")

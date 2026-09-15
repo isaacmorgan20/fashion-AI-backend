@@ -358,6 +358,26 @@ class NotificationEventCreate(BaseModel):
     metadata: Optional[dict] = None
 
 
+class SearchResultType(str, Enum):
+    CONVERSATION = "conversation"
+    CUSTOMER = "customer"
+    PRODUCT = "product"
+    ORDER = "order"
+
+
+class SearchResult(BaseModel):
+    type: SearchResultType
+    id: str
+    title: str
+    subtitle: str
+    url: Optional[str] = None
+
+
+class SearchResponse(BaseModel):
+    results: List[SearchResult]
+    query: str
+
+
 class StorefrontSettings(BaseModel):
     enabled: bool = True
     storeName: str = ""
