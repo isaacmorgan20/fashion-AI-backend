@@ -8,6 +8,7 @@ This module handles:
 - Webhook signature verification
 
 All credentials are stored securely in Firebase, never exposed to the frontend.
+Each seller has their own bot token stored in their channel credentials.
 """
 
 import hashlib
@@ -15,23 +16,21 @@ import hmac
 import logging
 from typing import Optional, Dict, Any
 import httpx
-from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramService:
-    """Service for Telegram Bot API operations."""
+    """Service for Telegram Bot API operations. Not a singleton - accepts bot_token per call."""
 
-    def __init__(self):
-        self.settings = get_settings()
-        self.bot_token = self.settings.telegram_bot_token
-        if not self.bot_token:
-            raise ValueError("TELEGRAM_BOT_TOKEN not configured")
-        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
+    @staticmethod
+    def _get_base_url(bot_token: str) -> str:
+        """Get the base URL for a given bot token."""
+        return f"https://api.telegram.org/bot{bot_token}"
 
     async def send_text_message(
         self,
+        bot_token: str,
         chat_id: str,
         text: str,
         parse_mode: Optional[str] = "HTML",
@@ -41,6 +40,7 @@ class TelegramService:
         Send a text message via Telegram Bot API.
 
         Args:
+            bot_token: The seller's Telegram bot token
             chat_id: Recipient's chat ID (Telegram chat ID)
             text: Message text to send
             parse_mode: Parse mode for message formatting (HTML, Markdown)
@@ -52,10 +52,11 @@ class TelegramService:
         Raises:
             ValueError: If bot token not configured or Telegram returns an error
         """
-        if not self.bot_token:
-            raise ValueError("Telegram bot token not configured")
+        if not bot_token:
+            raise ValueError("Telegram bot token not provided")
 
-        url = f"{self.base_url}/sendMessage"
+        base_url = self._get_base_url(bot_token)
+        url = f"{base_url}/sendMessage"
 
         payload = {
             "chat_id": chat_id,
@@ -88,6 +89,7 @@ class TelegramService:
 
     async def send_image_message(
         self,
+        bot_token: str,
         chat_id: str,
         image_url: str,
         caption: str = "",
@@ -97,6 +99,7 @@ class TelegramService:
         Send an image message via Telegram Bot API.
 
         Args:
+            bot_token: The seller's Telegram bot token
             chat_id: Recipient's chat ID
             image_url: HTTPS URL of the image to send
             caption: Optional caption for the image
@@ -108,14 +111,15 @@ class TelegramService:
         Raises:
             ValueError: If bot token not configured or Telegram returns an error
         """
-        if not self.bot_token:
-            raise ValueError("Telegram bot token not configured")
+        if not bot_token:
+            raise ValueError("Telegram bot token not provided")
         if not image_url:
             raise ValueError("Image URL is required")
         if not image_url.startswith("https://"):
             raise ValueError("Image URL must be HTTPS for Telegram delivery")
 
-        url = f"{self.base_url}/sendPhoto"
+        base_url = self._get_base_url(bot_token)
+        url = f"{base_url}/sendPhoto"
 
         payload = {
             "chat_id": chat_id,
@@ -147,6 +151,7 @@ class TelegramService:
 
     async def set_webhook(
         self,
+        bot_token: str,
         url: str,
         secret_token: Optional[str] = None,
         allowed_updates: Optional[list] = None,
@@ -156,6 +161,7 @@ class TelegramService:
         Set the webhook URL for receiving updates.
 
         Args:
+            bot_token: The seller's Telegram bot token
             url: HTTPS URL to receive updates
             secret_token: Secret token for webhook verification (HMAC-SHA256)
             allowed_updates: List of update types to receive
@@ -164,10 +170,11 @@ class TelegramService:
         Returns:
             API response dict
         """
-        if not self.bot_token:
-            raise ValueError("Telegram bot token not configured")
+        if not bot_token:
+            raise ValueError("Telegram bot token not provided")
 
-        url_endpoint = f"{self.base_url}/setWebhook"
+        base_url = self._get_base_url(bot_token)
+        url_endpoint = f"{base_url}/setWebhook"
 
         payload = {
             "url": url,
@@ -191,20 +198,22 @@ class TelegramService:
 
             return response.json()
 
-    async def delete_webhook(self, drop_pending_updates: bool = True) -> Dict[str, Any]:
+    async def delete_webhook(self, bot_token: str, drop_pending_updates: bool = True) -> Dict[str, Any]:
         """
         Delete the webhook.
 
         Args:
+            bot_token: The seller's Telegram bot token
             drop_pending_updates: Drop all pending updates
 
         Returns:
             API response dict
         """
-        if not self.bot_token:
-            raise ValueError("Telegram bot token not configured")
+        if not bot_token:
+            raise ValueError("Telegram bot token not provided")
 
-        url = f"{self.base_url}/deleteWebhook"
+        base_url = self._get_base_url(bot_token)
+        url = f"{base_url}/deleteWebhook"
 
         payload = {
             "drop_pending_updates": drop_pending_updates,
@@ -221,17 +230,21 @@ class TelegramService:
 
             return response.json()
 
-    async def get_webhook_info(self) -> Dict[str, Any]:
+    async def get_webhook_info(self, bot_token: str) -> Dict[str, Any]:
         """
         Get current webhook status.
+
+        Args:
+            bot_token: The seller's Telegram bot token
 
         Returns:
             API response dict with webhook info
         """
-        if not self.bot_token:
-            raise ValueError("Telegram bot token not configured")
+        if not bot_token:
+            raise ValueError("Telegram bot token not provided")
 
-        url = f"{self.base_url}/getWebhookInfo"
+        base_url = self._get_base_url(bot_token)
+        url = f"{base_url}/getWebhookInfo"
 
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=30)
@@ -244,17 +257,21 @@ class TelegramService:
 
             return response.json()
 
-    async def get_me(self) -> Dict[str, Any]:
+    async def get_me(self, bot_token: str) -> Dict[str, Any]:
         """
         Get bot information.
+
+        Args:
+            bot_token: The seller's Telegram bot token
 
         Returns:
             API response dict with bot info
         """
-        if not self.bot_token:
-            raise ValueError("Telegram bot token not configured")
+        if not bot_token:
+            raise ValueError("Telegram bot token not provided")
 
-        url = f"{self.base_url}/getMe"
+        base_url = self._get_base_url(bot_token)
+        url = f"{base_url}/getMe"
 
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=30)
@@ -318,5 +335,5 @@ class TelegramService:
         return False
 
 
-# Singleton instance
+# Service instance (stateless, accepts bot_token per call)
 telegram_service = TelegramService()

@@ -2882,9 +2882,10 @@ async def setup_telegram_channel(
     # Build webhook URL for this seller
     webhook_url = f"{get_settings().webhook_base_url}/webhook/telegram/{user_id}"
     
-    # Register webhook with Telegram
+    # Register webhook with Telegram using seller's bot token
     try:
         webhook_result = await telegram_service.set_webhook(
+            bot_token=bot_token,
             url=webhook_url,
             secret_token=webhook_secret,
             allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post"],
@@ -2898,9 +2899,9 @@ async def setup_telegram_channel(
         logger.error(f"Failed to set Telegram webhook: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to set webhook: {str(e)}")
     
-    # Get bot info for display
+    # Get bot info for display using seller's bot token
     try:
-        bot_info = await telegram_service.get_me()
+        bot_info = await telegram_service.get_me(bot_token)
         bot_username = bot_info.get("result", {}).get("username", "Unknown")
         display_name = f"@{bot_username}"
     except Exception:
@@ -2944,11 +2945,12 @@ async def disconnect_telegram(
     if not check_team_permission(db, user_id, current_user["uid"], "canManageSettings"):
         raise HTTPException(status_code=403, detail="You do not have permission to perform this action")
     
-    # Delete webhook from Telegram
+    # Delete webhook from Telegram using seller's bot token
     try:
         channel = get_user_channel(db, user_id, "telegram")
         if channel and channel.get("credentials", {}).get("bot_token"):
-            await telegram_service.delete_webhook(drop_pending_updates=True)
+            bot_token = channel["credentials"]["bot_token"]
+            await telegram_service.delete_webhook(bot_token, drop_pending_updates=True)
     except Exception as e:
         logger.warning(f"Failed to delete Telegram webhook: {e}")
     
@@ -3838,9 +3840,15 @@ async def _send_channel_reply(
     metadata = channel.get("metadata") or {}
     provider = metadata.get("provider", "meta")
     
+    # Get bot_token for Telegram from channel credentials
+    bot_token = channel.get("credentials", {}).get("bot_token") if provider == "telegram" else None
+    
     try:
         if provider == "telegram":
-            await telegram_service.send_text_message(to_identifier, message)
+            if not bot_token:
+                logger.error(f"No bot_token in channel credentials for seller: {seller_id}")
+                return
+            await telegram_service.send_text_message(bot_token, to_identifier, message)
             # Send product images if mentioned
             if products_mentioned and products:
                 product_map = {p.name: p for p in products}
@@ -3853,7 +3861,7 @@ async def _send_channel_reply(
                                 caption += f"\nSizes: {', '.join(product.sizes)}"
                             if product.colors:
                                 caption += f"\nColors: {', '.join(product.colors)}"
-                            await telegram_service.send_image_message(to_identifier, product.image, caption)
+                            await telegram_service.send_image_message(bot_token, to_identifier, product.image, caption)
                         except Exception as e:
                             logger.error(f"Failed to send Telegram product image for {product_name}: {e}")
         elif provider == "wagate":
@@ -3865,7 +3873,8 @@ async def _send_channel_reply(
         logger.error(f"Send failed (token issue) for provider {provider}: {e}")
         # Mark channel as disconnected
         db = get_firestore_client()
-        upsert_user_channel(db, seller_id, "whatsapp", {
+        channel_type = "telegram" if provider == "telegram" else "whatsapp"
+        upsert_user_channel(db, seller_id, channel_type, {
             "status": ChannelConnectionStatus.DISCONNECTED.value,
             "metadata": {
                 **(channel.get("metadata") or {}),
