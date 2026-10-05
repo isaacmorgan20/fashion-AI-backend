@@ -67,6 +67,7 @@ class NormalizedInboundEvent:
     text: str
     timestamp: str
     raw_event: Dict[str, Any]
+    contact_name: Optional[str] = None
 
 
 class WAGateVerificationError(Exception):
@@ -314,13 +315,24 @@ class MetaFormatWAGateParser(WAGatePayloadParser):
         """
         # Extract required fields
         external_message_id = message.get("id", "")
-        from_phone = message.get("from", "")
+        # Normalize phone number (remove + and any formatting) to match contact wa_id format
+        from_phone = message.get("from", "").replace("+", "").replace(" ", "").replace("-", "")
         message_type = message.get("type", "text")
         timestamp = message.get("timestamp", str(int(__import__("time").time())))
         
         if not external_message_id or not from_phone:
             logger.warning(f"Message missing required fields (id/from) for seller {seller_id}: {message}")
             return None
+        
+        # Extract contact profile name from Meta's contacts array
+        contact_name = None
+        contacts = value_context.get("contacts", [])
+        for contact in contacts:
+            wa_id = contact.get("wa_id", "").replace("+", "")
+            if wa_id == from_phone:
+                profile = contact.get("profile", {})
+                contact_name = profile.get("name", "")
+                break
         
         # Extract text content based on message type
         text = self._extract_text_content(message, message_type)
@@ -344,7 +356,8 @@ class MetaFormatWAGateParser(WAGatePayloadParser):
             message_type=message_type,
             text=text,
             timestamp=timestamp,
-            raw_event=message
+            raw_event=message,
+            contact_name=contact_name
         )
     
     def _extract_text_content(self, message: Dict[str, Any], message_type: str) -> str:
@@ -678,6 +691,7 @@ async def _process_normalized_event(
     message_type = event.message_type
     text = event.text
     timestamp = event.timestamp
+    contact_name = event.contact_name
     
     if not text:
         logger.debug(f"Skipping empty message {message_id} for seller {seller_id}")
@@ -685,8 +699,8 @@ async def _process_normalized_event(
     
     db = get_firestore_client()
     
-    # Find or create customer by phone number
-    customer = _find_or_create_customer_by_phone(db, seller_id, phone)
+    # Find or create customer by phone number with contact profile name
+    customer = _find_or_create_customer_by_phone(db, seller_id, phone, contact_name)
     
     # Find or create conversation for this customer
     conversation = _find_or_create_conversation(
@@ -843,7 +857,8 @@ def create_test_normalized_event(
     message_type: str = "text",
     text: str = "Hello, test message",
     timestamp: str = "1700000000",
-    raw_event: Optional[Dict[str, Any]] = None
+    raw_event: Optional[Dict[str, Any]] = None,
+    contact_name: Optional[str] = None
 ) -> NormalizedInboundEvent:
     """Create a test NormalizedInboundEvent for unit testing."""
     return NormalizedInboundEvent(
@@ -854,7 +869,8 @@ def create_test_normalized_event(
         message_type=message_type,
         text=text,
         timestamp=timestamp,
-        raw_event=raw_event or {}
+        raw_event=raw_event or {},
+        contact_name=contact_name
     )
 
 

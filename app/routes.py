@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 _settings_cache: dict = {}
 _SETTINGS_CACHE_TTL = 30  # seconds
 
+# Product cache - stores products per seller
+# Key: user_id, Value: (products_list, timestamp)
+_products_cache: dict = {}
+_PRODUCTS_CACHE_TTL = 30  # seconds
+
 # Request-scoped settings cache using contextvar
 _current_request_settings: ContextVar[Optional[dict]] = ContextVar('_current_request_settings', default=None)
 
@@ -258,7 +263,15 @@ def get_user_business_info(db, user_id: str) -> dict:
 
 
 def get_user_products(db, user_id: str) -> List[ProductBase]:
-    """Get products for the current user's business."""
+    """Get products for the current user's business. Uses in-memory cache with TTL."""
+    now = time.time()
+    if user_id in _products_cache:
+        cached_products, cached_time = _products_cache[user_id]
+        if now - cached_time < _PRODUCTS_CACHE_TTL:
+            logger.debug(f"[FIRESTORE] Products cache HIT for user={user_id}")
+            return cached_products
+    
+    logger.debug(f"[FIRESTORE] Products cache MISS for user={user_id}")
     products_ref = db.collection("users").document(user_id).collection("products")
     docs = products_ref.stream()
     products = []
@@ -266,7 +279,18 @@ def get_user_products(db, user_id: str) -> List[ProductBase]:
         data = doc.to_dict()
         data["id"] = doc.id
         products.append(ProductBase(**data))
+    
+    _products_cache[user_id] = (products, now)
     return products
+
+
+def clear_products_cache(user_id: Optional[str] = None) -> None:
+    """Clear products cache for a user or all users."""
+    global _products_cache
+    if user_id:
+        _products_cache.pop(user_id, None)
+    else:
+        _products_cache.clear()
 
 
 def get_user_ai_settings(db, user_id: str) -> dict:
@@ -338,9 +362,19 @@ async def list_conversations(
     for doc in docs:
         data = doc.to_dict()
         data["id"] = doc.id
-        conversations.append(ConversationBase(**data))
+        conversations.append(data)
     
-    return conversations
+    # Synchronize conversation names from customer records for conversations with fallback names
+    # Only fetch customer when conversation name is a generic fallback
+    for conv in conversations:
+        conv_name = conv.get("name", "")
+        channel = conv.get("channel", "")
+        if _is_generic_fallback_name(conv_name, channel):
+            customer = _get_customer_for_conversation(db, user_id, conv)
+            if customer and _has_real_customer_name(customer, channel):
+                _sync_conversation_name_from_customer(db, user_id, conv, customer)
+    
+    return [ConversationBase(**c) for c in conversations]
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationBase)
@@ -680,6 +714,10 @@ async def create_product(
     doc_ref.set(data)
     data["id"] = doc_ref.id
     
+    # Invalidate product caches
+    clear_products_cache(user_id)
+    clear_storefront_cache(user_id)
+    
     return ProductBase(**data)
 
 
@@ -707,6 +745,11 @@ async def update_product(
     updated_doc = doc_ref.get()
     data = updated_doc.to_dict()
     data["id"] = updated_doc.id
+    
+    # Invalidate product caches
+    clear_products_cache(user_id)
+    clear_storefront_cache(user_id)
+    
     return ProductBase(**data)
 
 
@@ -728,6 +771,11 @@ async def delete_product(
         raise HTTPException(status_code=404, detail="Product not found")
     
     doc_ref.delete()
+    
+    # Invalidate product caches
+    clear_products_cache(user_id)
+    clear_storefront_cache(user_id)
+    
     return {"message": "Product deleted"}
 
 
@@ -3614,10 +3662,20 @@ async def _process_whatsapp_webhook(
     
     messages = value.get("messages", [])
     statuses = value.get("statuses", [])
+    contacts = value.get("contacts", [])  # Contact profile info from Meta
+    
+    # Build contact name lookup by wa_id (phone number)
+    contact_name_by_phone = {}
+    for contact in contacts:
+        wa_id = contact.get("wa_id", "").replace("+", "")
+        profile = contact.get("profile", {})
+        name = profile.get("name", "")
+        if wa_id and name:
+            contact_name_by_phone[wa_id] = name
     
     # Handle incoming messages
     for msg in messages:
-        await _handle_incoming_whatsapp_message(seller_id, msg, channel)
+        await _handle_incoming_whatsapp_message(seller_id, msg, channel, contact_name_by_phone)
     
     # Handle message status updates (delivered, read, etc.)
     for status in statuses:
@@ -3627,15 +3685,20 @@ async def _process_whatsapp_webhook(
 async def _handle_incoming_whatsapp_message(
     seller_id: str,
     message: dict,
-    channel: dict
+    channel: dict,
+    contact_name_by_phone: dict = None
 ):
-    """Handle a single incoming WhatsApp message."""
+    """Handle a single incoming WhatsApp message. Uses contact profile name from Meta webhook when available."""
     from app.agent import agent
     
-    phone = message.get("from", "")
+    # Normalize phone number (remove + and any formatting)
+    phone = message.get("from", "").replace("+", "").replace(" ", "").replace("-", "")
     message_id = message.get("id", "")
     message_type = message.get("type", "text")
     timestamp = message.get("timestamp", str(int(__import__("time").time())))
+    
+    # Extract contact profile name from Meta webhook contacts array
+    contact_name = contact_name_by_phone.get(phone, "") if contact_name_by_phone else ""
     
     # Extract text content
     if message_type == "text":
@@ -3654,8 +3717,8 @@ async def _handle_incoming_whatsapp_message(
     
     db = get_firestore_client()
     
-    # Find or create customer by phone number
-    customer = _find_or_create_customer_by_phone(db, seller_id, phone)
+    # Find or create customer by phone number with contact profile name
+    customer = _find_or_create_customer_by_phone(db, seller_id, phone, contact_name)
     
     # Find or create conversation for this customer
     conversation = _find_or_create_conversation(
@@ -3954,39 +4017,148 @@ async def _send_channel_reply(
         logger.error(f"Send failed for provider {provider}: {e}")
 
 
+def _is_generic_fallback_name(name: str, channel: str) -> bool:
+    """Check if a name is a generic fallback (e.g., 'Telegram User 1234', 'Customer 5678')."""
+    if not name:
+        return True
+    name_lower = name.lower().strip()
+    channel_lower = channel.lower().strip()
+    
+    # Check for Telegram fallback patterns
+    if channel_lower == "telegram":
+        if name_lower.startswith("telegram user"):
+            return True
+    # Check for WhatsApp fallback patterns
+    elif channel_lower == "whatsapp":
+        if name_lower.startswith("customer "):
+            return True
+    # Check for generic patterns
+    if name_lower.startswith("customer ") and len(name) <= 15:
+        return True
+    if name_lower.startswith("telegram user"):
+        return True
+    
+    return False
+
+
+def _has_real_customer_name(customer_data: dict, channel: str) -> bool:
+    """Check if customer has a real name (not a generic fallback)."""
+    name = customer_data.get("name", "")
+    return bool(name and not _is_generic_fallback_name(name, channel))
+
+
+def _get_customer_for_conversation(db, seller_id: str, conversation: dict) -> Optional[dict]:
+    """Fetch the customer associated with a conversation using phone or chat_id."""
+    channel = conversation.get("channel", "")
+    phone = conversation.get("phone", "")
+    chat_id = conversation.get("chat_id", "")
+    
+    customers_ref = db.collection("users").document(seller_id).collection("customers")
+    
+    if channel.lower() == "telegram" and chat_id:
+        # Telegram: match by telegram_id (stored as chat_id in conversation)
+        query = customers_ref.where("telegram_id", "==", chat_id).limit(1)
+        docs = list(query.stream())
+        if docs:
+            data = docs[0].to_dict()
+            data["id"] = docs[0].id
+            return data
+    elif channel.lower() == "whatsapp" and phone:
+        # WhatsApp: match by phone
+        query = customers_ref.where("phone", "==", phone).limit(1)
+        docs = list(query.stream())
+        if docs:
+            data = docs[0].to_dict()
+            data["id"] = docs[0].id
+            return data
+    return None
+
+
+def _sync_conversation_name_from_customer(db, seller_id: str, conversation: dict, customer: dict) -> bool:
+    """
+    Update conversation name from customer if conversation has a fallback name
+    and customer has a real name. Returns True if updated.
+    """
+    conv_name = conversation.get("name", "")
+    channel = conversation.get("channel", "")
+    customer_name = customer.get("name", "")
+    customer_initials = customer.get("initials", "")
+    
+    # Only update if conversation has fallback and customer has real name
+    if _is_generic_fallback_name(conv_name, channel) and customer_name and not _is_generic_fallback_name(customer_name, channel):
+        conv_ref = db.collection("users").document(seller_id).collection("conversations").document(conversation["id"])
+        conv_ref.update({
+            "name": customer_name,
+            "initials": customer_initials,
+            "updatedAt": __import__("time").time()
+        })
+        conversation["name"] = customer_name
+        conversation["initials"] = customer_initials
+        return True
+    return False
+
+
 def _find_or_create_customer_by_telegram_id(db, seller_id: str, telegram_user_id: str, raw_event: dict = None) -> dict:
-    """Find or create a customer by Telegram user ID."""
+    """Find or create a customer by Telegram user ID. Uses real Telegram profile name when available."""
     customers_ref = db.collection("users").document(seller_id).collection("customers")
     
     # Search by telegram_id
     query = customers_ref.where("telegram_id", "==", telegram_user_id)
     docs = list(query.stream())
     
+    now = __import__("time").time()
+    from_user = raw_event.get("from", {}) if raw_event else {}
+    
+    # Extract real name from Telegram profile
+    first_name = from_user.get("first_name", "") if raw_event else ""
+    last_name = from_user.get("last_name", "") if raw_event else ""
+    username = from_user.get("username", "") if raw_event else ""
+    
+    # Build real name from first_name + last_name, fallback to username
+    real_name = " ".join(filter(None, [first_name, last_name])).strip()
+    if not real_name and username:
+        real_name = username
+    
     if docs:
         data = docs[0].to_dict()
         data["id"] = docs[0].id
+        
+        # Update existing customer with better name info if available
+        updates = {}
+        current_name = data.get("name", "")
+        
+        # If we have a real name and current name is generic fallback, update it
+        if real_name and _is_generic_fallback_name(current_name, "telegram"):
+            updates["name"] = real_name
+            updates["initials"] = "".join([p[0] for p in real_name.split()[:2]]).upper() if real_name else "TU"
+        
+        # Update Telegram profile fields if we have them
+        if username and username != data.get("telegram_username", ""):
+            updates["telegram_username"] = username
+        if first_name and first_name != data.get("telegram_first_name", ""):
+            updates["telegram_first_name"] = first_name
+        if last_name and last_name != data.get("telegram_last_name", ""):
+            updates["telegram_last_name"] = last_name
+        
+        if updates:
+            updates["updatedAt"] = now
+            customers_ref.document(docs[0].id).update(updates)
+            data.update(updates)
+        
         return data
     
-    # Also check by phone in case they're linked
-    phone = ""
-    if raw_event and "from" in raw_event:
-        # Telegram doesn't always provide phone, but we can store telegram_id
-        pass
-    
-    # Create new customer
-    now = __import__("time").time()
-    from_user = raw_event.get("from", {}) if raw_event else {}
-    name = f"Telegram User {telegram_user_id[-4:]}" if len(telegram_user_id) >= 4 else f"Telegram User {telegram_user_id}"
-    initials = from_user.get("first_name", "TU")[:2].upper() if from_user.get("first_name") else "TU"
+    # Create new customer with real name if available
+    name = real_name if real_name else (f"Telegram User {telegram_user_id[-4:]}" if len(telegram_user_id) >= 4 else f"Telegram User {telegram_user_id}")
+    initials = "".join([p[0] for p in name.split()[:2]]).upper() if name and not _is_generic_fallback_name(name, "telegram") else (from_user.get("first_name", "TU")[:2].upper() if from_user.get("first_name") else "TU")
     
     customer_data = {
         "name": name,
         "initials": initials,
         "phone": "",
         "telegram_id": telegram_user_id,
-        "telegram_username": raw_event.get("from", {}).get("username", "") if raw_event else "",
-        "telegram_first_name": raw_event.get("from", {}).get("first_name", "") if raw_event else "",
-        "telegram_last_name": raw_event.get("from", {}).get("last_name", "") if raw_event else "",
+        "telegram_username": username,
+        "telegram_first_name": first_name,
+        "telegram_last_name": last_name,
         "email": "",
         "location": "",
         "status": "New",
@@ -4011,23 +4183,39 @@ def _find_or_create_customer_by_telegram_id(db, seller_id: str, telegram_user_id
     return customer_data
 
 
-def _find_or_create_customer_by_phone(db, seller_id: str, phone: str) -> dict:
-    """Find or create a customer by phone number."""
+def _find_or_create_customer_by_phone(db, seller_id: str, phone: str, contact_name: str = None) -> dict:
+    """Find or create a customer by phone number. Uses contact profile name from Meta webhook when available."""
     customers_ref = db.collection("users").document(seller_id).collection("customers")
     
     # Search by phone
     query = customers_ref.where("phone", "==", phone)
     docs = list(query.stream())
     
+    now = __import__("time").time()
+    
     if docs:
         data = docs[0].to_dict()
         data["id"] = docs[0].id
+        
+        # Update existing customer with better name info if available
+        updates = {}
+        if contact_name and contact_name.strip():
+            # Only update if current name is generic fallback or empty
+            current_name = data.get("name", "")
+            if not current_name or _is_generic_fallback_name(current_name, "whatsapp"):
+                updates["name"] = contact_name.strip()
+                updates["initials"] = "".join([p[0] for p in contact_name.strip().split()[:2]]).upper()
+        
+        if updates:
+            updates["updatedAt"] = now
+            customers_ref.document(docs[0].id).update(updates)
+            data.update(updates)
+        
         return data
     
-    # Create new customer
-    now = __import__("time").time()
-    name = f"Customer {phone[-4:]}" if len(phone) >= 4 else f"Customer {phone}"
-    initials = phone[-2:].upper() if len(phone) >= 2 else "CU"
+    # Create new customer with contact profile name if available
+    name = contact_name.strip() if contact_name and contact_name.strip() else (f"Customer {phone[-4:]}" if len(phone) >= 4 else f"Customer {phone}")
+    initials = "".join([p[0] for p in name.split()[:2]]).upper() if name and not _is_generic_fallback_name(name, "whatsapp") else phone[-2:].upper() if len(phone) >= 2 else "CU"
     
     customer_data = {
         "name": name,
@@ -4079,9 +4267,35 @@ def _find_or_create_conversation(
                 data["telegram_username"] = customer.get("telegram_username")
                 data["telegram_first_name"] = customer.get("telegram_first_name")
                 data["telegram_last_name"] = customer.get("telegram_last_name")
+            # Update conversation name from customer if customer has a real name
+            # and conversation has a generic fallback name
+            customer_name = customer.get("name", "")
+            current_conv_name = data.get("name", "")
+            if customer_name and not _is_generic_fallback_name(current_conv_name, channel):
+                pass  # Conversation already has a real name
+            elif customer_name and _is_generic_fallback_name(current_conv_name, channel):
+                data["name"] = customer_name
+                data["initials"] = customer.get("initials", "")
+                # Persist the name update to Firestore
+                doc.reference.update({
+                    "name": customer_name,
+                    "initials": customer.get("initials", ""),
+                    "updatedAt": __import__("time").time()
+                })
             return data
         if not chat_id and data.get("phone") == phone:
             data["id"] = doc.id
+            # Update conversation name from customer for WhatsApp too
+            customer_name = customer.get("name", "")
+            current_conv_name = data.get("name", "")
+            if customer_name and _is_generic_fallback_name(current_conv_name, channel):
+                data["name"] = customer_name
+                data["initials"] = customer.get("initials", "")
+                doc.reference.update({
+                    "name": customer_name,
+                    "initials": customer.get("initials", ""),
+                    "updatedAt": __import__("time").time()
+                })
             return data
     
     # Create new conversation
