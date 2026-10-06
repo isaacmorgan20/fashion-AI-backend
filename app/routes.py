@@ -2425,6 +2425,30 @@ async def mark_notification_read_v2(
     return {"message": "Notification marked as read"}
 
 
+@router.patch("/notifications/events")
+async def mark_all_notifications_read(
+    current_user: dict = Depends(get_current_user)
+):
+    """Mark all notification events as read for the current seller."""
+    db = get_firestore_client()
+    user_id = current_user["uid"]
+    if not check_team_permission(db, user_id, current_user["uid"], "canManageSettings"):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action")
+    
+    notifications_ref = db.collection("users").document(user_id).collection("notifications")
+    unread_query = notifications_ref.where("read", "==", False).limit(500)
+    docs = list(unread_query.stream())
+    
+    batch = db.batch()
+    for doc in docs:
+        batch.update(doc.ref, {"read": True})
+    
+    if docs:
+        batch.commit()
+    
+    return {"message": f"Marked {len(docs)} notifications as read", "count": len(docs)}
+
+
 # ============================================================
 # CHANNELS
 # ============================================================
