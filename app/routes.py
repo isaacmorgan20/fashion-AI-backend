@@ -2441,7 +2441,7 @@ async def mark_all_notifications_read(
     
     batch = db.batch()
     for doc in docs:
-        batch.update(doc.ref, {"read": True})
+        batch.update(doc.reference, {"read": True})
     
     if docs:
         batch.commit()
